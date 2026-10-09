@@ -129,6 +129,9 @@ auto=0 使本服务在 AT 激活成功后启动接口，避免开机竞态。
   dhcp_timeout        60         租约等待窗口，秒（5..600）
   health_interval     30         已获租约后的 AT 健康检查间隔，秒（5..600）
   health_failures     3          连续失败阈值（1..10），仅重启本服务启动的接口
+  recover_mode        cfun_cycle 连续失败后的射频恢复；none 禁用，cfun_cycle 执行 CFUN=0/1
+  recover_threshold   3          连续 AT 健康/激活失败恢复阈值（1..100）
+  recover_cooldown    120        恢复尝试最小间隔，秒（0..86400），失败尝试也计入
 
 transaction_timeout 不得小于 query_timeout。多设备筛选结果、所选 AT 口或
 网卡存在歧义时拒绝连接。at_interface 和 at_device 同时设置时均须匹配。
@@ -154,7 +157,12 @@ AT 操作串行执行并有超时；注册通过主动查询判断本地/漫游�
 PDP 已激活时不重复写 CGDCONT。只有激活路径使用 ZTE AT+ZGACT，
 需要在实际固件上验证，不能当作通用蜂窝协议。
 AT+CFUN? 确认射频关闭时才启用射频，不反复重置已经启用的调制解调器。
+激活前关闭 AT 回显（尽力），要求 CPIN 为 READY，并查询 CSQ（私有诊断）。
+CGATT? 确认未附着时才执行 CGATT=1；未知状态则退避重试，不盲目写入。
 已有 DHCP 租约也会周期检查注册/PDP；连续失败达到阈值后才对拥有的接口重连。
+恢复同时受 recover_threshold 和 recover_cooldown 限制，不替代指数退避；
+在线健康失败还须达到 health_failures，且仅对本服务拥有的接口执行 CFUN 恢复。
+USB hotplug 优先按 PRODUCT 或 sysfs 中的 VID/PID 过滤，信息缺失时保守通知。
 
 procd respawn 只恢复进程崩溃；网络失败使用有上限的退避间隔重试。
 设备消失/代次变化取消旧串口任务；DHCP 由 netifd 管理，没有第二个 udhcpc。

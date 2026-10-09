@@ -17,6 +17,8 @@ interrupted=0
 transaction_active=0
 health_next=0
 health_bad=0
+recover_bad=0
+recover_next=0
 
 log() { logger -t mf832s "$*"; }
 now() { date +%s; }
@@ -70,11 +72,15 @@ load_config() {
 	config_get dhcp_timeout main dhcp_timeout 60
 	config_get health_interval main health_interval 30
 	config_get health_failures main health_failures 3
+	config_get recover_mode main recover_mode cfun_cycle
+	config_get recover_threshold main recover_threshold 3
+	config_get recover_cooldown main recover_cooldown 120
 	valid_name "$interface" || return 1
 	# APNs cannot inject chat syntax or AT commands; the empty default is allowed.
 	case "$apn" in *[!a-zA-Z0-9._-]*) return 1;; esac
 	[ "${#apn}" -le 100 ] || return 1
 	case "$pdp_type" in IP|IPV6|IPV4V6) :;; *) return 1;; esac
+	case "$recover_mode" in none|cfun_cycle) :;; *) return 1;; esac
 	number cid "$cid" 1 16 &&
 	number query_timeout "$query_timeout" 1 30 &&
 	number transaction_timeout "$transaction_timeout" 5 300 &&
@@ -83,7 +89,9 @@ load_config() {
 	number retry_max "$retry_max" "$retry_initial" 3600 &&
 	number dhcp_timeout "$dhcp_timeout" 5 600 &&
 	number health_interval "$health_interval" 5 600 &&
-	number health_failures "$health_failures" 1 10 || return 1
+	number health_failures "$health_failures" 1 10 &&
+	number recover_threshold "$recover_threshold" 1 100 &&
+	number recover_cooldown "$recover_cooldown" 0 86400 || return 1
 	[ "$transaction_timeout" -ge "$query_timeout" ] || return 1
 	case "$vid$pid" in *[!0-9a-fA-F]*) return 1;; esac
 	[ "${#vid}" = 4 ] && [ "${#pid}" = 4 ] || return 1
@@ -344,6 +352,39 @@ function_ready() {
 	case "$state" in 1) return 0;; 0) query 'AT+CFUN=1';; *) return 1;; esac
 }
 
+preinit() {
+	query ATE0 || :
+	query 'AT+CPIN?' || return 1
+	awk '
+		/\+CPIN:/ {
+			line=substr($0,index($0,"+CPIN:")+6)
+			gsub(/\r/,"",line); gsub(/[ \t]/,"",line)
+			if (line=="READY") ready=1
+			else not_ready=1
+		}
+		END { exit (!ready || not_ready) }
+	' "$RUN/response" || return 1
+	# Keep diagnostics private, just like other AT responses.
+	query 'AT+CSQ' || :
+	[ "$interrupted" = 0 ] && same_generation
+}
+
+attached() {
+	query 'AT+CGATT?' || return 2
+	awk '
+		/\+CGATT:/ {
+			line=substr($0,index($0,"+CGATT:")+7)
+			gsub(/\r/,"",line); gsub(/[ \t]/,"",line)
+			if (line=="0" || line=="1") {
+				if (known && state!=line) malformed=1
+				known=1; state=line
+			}
+			else malformed=1
+		}
+		END { exit (malformed || !known ? 2 : (state=="1" ? 0 : 1)) }
+	' "$RUN/response"
+}
+
 health() {
 	local cg zg
 	begin_transaction && registered || return 1
@@ -355,8 +396,10 @@ health() {
 }
 
 activate() {
-	local cg zg
-	begin_transaction && function_ready && registered || return 1
+	local cg zg attach
+	begin_transaction && function_ready && preinit && registered || return 1
+	attached; attach=$?
+	case "$attach" in 0|1) :;; *) return 1;; esac
 	active CGACT; cg=$?
 	active ZGACT; zg=$?
 	[ "$interrupted" = 0 ] && same_generation || return 1
@@ -368,8 +411,12 @@ activate() {
 	# Unknown CGACT state is not safe to overwrite; retry without changing the APN.
 	[ "$cg" != 2 ] || [ "$zg" = 0 ] || return 1
 	if [ "$cg" != 0 ] && [ "$zg" != 0 ]; then
-		query "AT+CGDCONT=$cid,\"$pdp_type\",\"$apn\"" &&
-		query "AT+CGATT=1" &&
+		query "AT+CGDCONT=$cid,\"$pdp_type\",\"$apn\"" || return 1
+	fi
+	if [ "$attach" = 1 ]; then
+		query 'AT+CGATT=1' || return 1
+	fi
+	if [ "$cg" != 0 ] && [ "$zg" != 0 ]; then
 		query "AT+CGACT=1,$cid" || return 1
 	fi
 	if [ "$zg" != 0 ]; then
@@ -385,8 +432,43 @@ retry() {
 	[ "$backoff" -le "$retry_max" ] || backoff=$retry_max
 }
 
+record_failure() {
+	[ "$interrupted" = 0 ] && same_generation || return
+	[ "$recover_bad" -ge "$recover_threshold" ] || recover_bad=$((recover_bad + 1))
+}
+
+recovery_ready() {
+	[ "$interrupted" = 0 ] && same_generation &&
+	network_config "$net" && network_status "$net" &&
+	[ "$up" = false ] && [ "$pending" = false ]
+}
+
+recover() {
+	local rc
+	[ "$recover_mode" = cfun_cycle ] &&
+	[ "$recover_bad" -ge "$recover_threshold" ] &&
+	[ "$(now)" -ge "$recover_next" ] && recovery_ready || return
+	# Rate-limit attempts too, including failed or interrupted cycles.
+	recover_next=$(( $(now) + recover_cooldown ))
+	recover_bad=0
+	transaction_active=1
+	rc=1
+	if begin_transaction && recovery_ready && query 'AT+CFUN=0'; then
+		(
+			exec 9>&-
+			exec sleep 2
+		) &
+		child=$!
+		if await_child "$transaction_end" && query 'AT+CFUN=1'; then
+			rc=0
+		fi
+	fi
+	transaction_active=0
+	[ "$rc" != 0 ] || log 'Modem radio recovery completed; retrying after backoff'
+}
+
 reconcile() {
-	local previous current activation_rc
+	local previous current activation_rc recover_owned
 	previous=$generation
 	if ! discover; then
 		network_down
@@ -400,6 +482,7 @@ reconcile() {
 		backoff=$retry_initial
 		health_next=0
 		health_bad=0
+		recover_bad=0
 	fi
 	network_config "$net" && network_status "$net" || {
 		network_down
@@ -418,12 +501,22 @@ reconcile() {
 		health_next=$(( $(now) + health_interval ))
 		if [ "$activation_rc" = 0 ]; then
 			health_bad=0
+			recover_bad=0
 			backoff=$retry_initial
 		else
+			record_failure
 			health_bad=$((health_bad + 1))
 			if [ "$health_bad" -ge "$health_failures" ]; then
 				# An interface that we did not start must never be cycled.
-				network_down
+				recover_owned=0
+				if [ "$owned_device" = "$net" ] &&
+					[ "$owned_usb" = "$usb" ] &&
+					[ "$owned_generation" = "$generation" ]; then
+					recover_owned=1
+				fi
+				if network_down && [ "$recover_owned" = 1 ]; then
+					recover
+				fi
 				retry
 				health_bad=0
 				log 'Repeated modem health failures; backing off'
@@ -459,10 +552,13 @@ reconcile() {
 	activation_rc=$?
 	transaction_active=0
 	if [ "$activation_rc" != 0 ]; then
+		record_failure
+		recover
 		retry
 		[ "$interrupted" = 1 ] || log 'Registration or activation incomplete; backing off'
 		return
 	fi
+	recover_bad=0
 	same_generation && network_config "$net" && network_status "$net" || { retry; return; }
 	[ "$available" = true ] && [ "$pending" != true ] && [ "$up" != true ] || return
 	if ubus -t 2 call "network.interface.$interface" up >/dev/null 2>&1; then
