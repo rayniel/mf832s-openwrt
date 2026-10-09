@@ -53,6 +53,10 @@ load_config() {
 		log "set valid main.network and main.data_device values"
 		return 1
 	}
+	network_config_ready || {
+		log "network.$NETIF must be a DHCP interface bound to main.data_device"
+		return 1
+	}
 	case "$APN" in
 		*[!A-Za-z0-9._-]*|'') [ -z "$APN" ] || {
 			log "APN may contain only letters, digits, dot, underscore, and hyphen"
@@ -84,6 +88,7 @@ is_under_root() {
 
 find_usb_root() {
 	USB_ROOT=
+	USB_INSTANCE=
 	for _candidate in "$SYS_USB_ROOT"/*; do
 		[ -r "$_candidate/idVendor" ] && [ -r "$_candidate/idProduct" ] || continue
 		_candidate_vendor=$(cat "$_candidate/idVendor" 2>/dev/null | tr 'A-F' 'a-f')
@@ -92,22 +97,42 @@ find_usb_root() {
 		[ "$_candidate_vendor" = "$VENDOR" ] && [ "$_candidate_product" = "$PRODUCT_ID" ] || continue
 		[ -z "$USB_ROOT" ] || {
 			USB_ROOT=
+			USB_INSTANCE=
 			return 2
 		}
 		USB_ROOT=$(canonical "$_candidate") || USB_ROOT=
+		_busnum=$(cat "$_candidate/busnum" 2>/dev/null)
+		_devnum=$(cat "$_candidate/devnum" 2>/dev/null)
+		case "$_busnum:$_devnum" in
+			:*|*:|*[!0-9:]*) USB_ROOT=; return 1 ;;
+			*:*) ;;
+			*) USB_ROOT=; return 1 ;;
+		esac
+		USB_INSTANCE="$USB_ROOT:$_busnum:$_devnum"
 	done
-	[ -n "$USB_ROOT" ]
+	[ -n "$USB_ROOT" ] && [ -n "$USB_INSTANCE" ]
 }
 
 serial_ready() {
-	[ -c "$DEV_ROOT/${AT_PORT#/dev/}" ] || return 1
+	is_char_device "$DEV_ROOT/${AT_PORT#/dev/}" || return 1
 	[ -e "$SYS_TTY_ROOT/${AT_PORT##*/}/device" ] || return 1
 	is_under_root "$SYS_TTY_ROOT/${AT_PORT##*/}/device"
+}
+
+is_char_device() {
+	[ -c "$1" ]
 }
 
 network_device_ready() {
 	[ -e "$SYS_NET_ROOT/$DATA_DEVICE/device" ] || return 1
 	is_under_root "$SYS_NET_ROOT/$DATA_DEVICE/device"
+}
+
+network_config_ready() {
+	[ "$(uci -q get "network.$NETIF.proto" 2>/dev/null)" = dhcp ] || return 1
+	_configured_device=$(uci -q get "network.$NETIF.device" 2>/dev/null)
+	[ -n "$_configured_device" ] || _configured_device=$(uci -q get "network.$NETIF.ifname" 2>/dev/null)
+	[ "$_configured_device" = "$DATA_DEVICE" ]
 }
 
 interface_has_lease() {
@@ -135,9 +160,11 @@ at_registration() {
 	AT_CREG=
 	AT_GOT_OK=0
 	AT_DEADLINE=$AT_TIMEOUT
-	while [ "$AT_DEADLINE" -gt 0 ]; do
+	AT_LINES=0
+	while [ "$AT_LINES" -lt 8 ]; do
 		AT_LINE=
 		read -r -t "$AT_TIMEOUT" AT_LINE <&3 || break
+		AT_LINES=$((AT_LINES + 1))
 		AT_LINE=${AT_LINE%$(printf '\r')}
 		case "$AT_LINE" in
 			+CREG:*) AT_CREG=$AT_LINE ;;
@@ -186,7 +213,7 @@ bounded_retry_delay() {
 record_failure() {
 	FAILURES=$((FAILURES + 1))
 	[ "$FAILURES" -le "$MAX_FAILURES" ] || FAILURES=$MAX_FAILURES
-	RETRY_AT=$(($(date +%s) + $(bounded_retry_delay)))
+	RETRY_AT=$((NOW + $(bounded_retry_delay)))
 	log "reconnect attempt failed ($FAILURES/$MAX_FAILURES); retry delayed"
 }
 
@@ -194,6 +221,7 @@ reset_connection_state() {
 	DEVICE_KEY=
 	NETWORK_REQUESTED=0
 	DHCP_DEADLINE=0
+	PDP_ATTEMPTED=0
 	FAILURES=0
 	RETRY_AT=0
 	NEXT_HEALTH=0
@@ -209,13 +237,14 @@ process_once() {
 		fi
 		return 0
 	fi
-	if [ "$USB_ROOT" != "$DEVICE_KEY" ]; then
+	if [ "$USB_INSTANCE" != "$DEVICE_KEY" ]; then
 		if [ -n "$DEVICE_KEY" ] && [ "$NETWORK_REQUESTED" = 1 ]; then
 			netif_down
 		fi
-		DEVICE_KEY=$USB_ROOT
+		DEVICE_KEY=$USB_INSTANCE
 		NETWORK_REQUESTED=0
 		DHCP_DEADLINE=0
+		PDP_ATTEMPTED=0
 		FAILURES=0
 		RETRY_AT=0
 		NEXT_HEALTH=0
@@ -232,6 +261,7 @@ process_once() {
 		}
 		NETWORK_REQUESTED=1
 		DHCP_DEADLINE=$((NOW + DHCP_WAIT))
+		PDP_ATTEMPTED=0
 		NEXT_HEALTH=$NOW
 		log "netifd interface requested; waiting for DHCP lease"
 	fi
@@ -244,20 +274,29 @@ process_once() {
 	fi
 	[ "$NOW" -ge "$NEXT_HEALTH" ] || return 0
 	NEXT_HEALTH=$((NOW + HEALTH_INTERVAL))
-	at_registration
-	_AT_STATE=$?
+	if at_registration; then
+		_AT_STATE=0
+	else
+		_AT_STATE=$?
+	fi
 	if [ "$_AT_STATE" -eq 0 ]; then
 		if interface_has_lease; then
 			return 0
 		fi
 		[ "$NOW" -ge "$DHCP_DEADLINE" ] || return 0
 		[ "$NOW" -ge "$RETRY_AT" ] || return 0
+		if [ "$PDP_ATTEMPTED" = 1 ]; then
+			record_failure
+			PDP_ATTEMPTED=0
+			DHCP_DEADLINE=$RETRY_AT
+			return 0
+		fi
 		activate_pdp || {
 			record_failure
 			return 1
 		}
-		FAILURES=0
-		RETRY_AT=$((NOW + RETRY_BASE))
+		PDP_ATTEMPTED=1
+		RETRY_AT=0
 		DHCP_DEADLINE=$((NOW + DHCP_WAIT))
 		log "PDP activation requested; allowing netifd to obtain a lease"
 	elif [ "$_AT_STATE" -eq 2 ]; then
@@ -275,7 +314,7 @@ process_once() {
 
 cleanup() {
 	STOPPING=1
-	if [ -n "$CHAT_PID" ]; then
+	if [ -n "${CHAT_PID:-}" ]; then
 		kill "$CHAT_PID" 2>/dev/null || :
 		wait "$CHAT_PID" 2>/dev/null || :
 		CHAT_PID=
@@ -304,6 +343,7 @@ worker_main() {
 	DEVICE_KEY=
 	NETWORK_REQUESTED=0
 	FAILURES=0
+	PDP_ATTEMPTED=0
 	RETRY_AT=0
 	NEXT_HEALTH=0
 	CHAT_PID=

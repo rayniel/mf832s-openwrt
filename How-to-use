@@ -1,53 +1,12 @@
-环境要求 openwrt 18.06.4   //其他版本有些软件名字不一致,需要手工修改,但仍可使用.
-Requirement system version openwrt 18.06.4   //other version have some package name or grammar issues,but still work if you can fix it by yourself.
+MF832S USB hotplug and automatic reconnect
+=========================================
 
-系统软件包要求
-Package Requirement
-----------------------------
-comgt-ncm 
-kmod-usb-net-huawei-cdc-ncm 
-usb-modeswitch 
-kmod-usb-serial 
-kmod-usb-serial-option 
-kmod-usb-serial-wwan 
-kmod-usb-net 
-kmod-usb-net-rndis 
-usbutils 
-luci-proto-ppp 
-luci-proto-ncm 
-luci-proto-qmi
+请先阅读 README.md 中的中文安装、配置和迁移说明。旧版“unmanaged + eth1 + 手动 udhcpc”的步骤已不再适用于监控服务。
 
-//所有包都需安装到位,看了很多论坛帖子和官网介绍总结的.虽然有些包名字看起来不需要,但是主要是安装这个包的时候系统会安装许多他的前置包,可能和那个前置包有关.
-//Install all packages and don't missing anything.
+快速检查：
+1. 为 modem 的实际 USB 数据网卡创建专用 netifd DHCP interface（旧版用 ifname，新版用 device）。
+2. 配置 /etc/config/mf832s 中的已确认 AT 串口、逻辑网络名和数据网卡；不要使用正在被其他 WAN 管理的设备。
+3. 启用服务：/etc/init.d/mf832s-monitor enable && /etc/init.d/mf832s-monitor start
+4. 查看日志：logread -e mf832s
 
-
-
-
-
-1.添加一个名字叫"mf832s"的interface.
-  Add a interface call "mf832s".
-2.在通用设置页面设置协议为"未设置"
-  Set the protocol to "unmanaged" at General Setup page.
-3.在高级设置中将自动启动与强制连接勾选.
-  Click "bring up on boot" and "force link" at Advanced Settings page.
-4.在物理设置页面将端口选为eth1
-  Select interface "eth1" at Physical Settings page.
-5.在防火墙页面选择"wan"区域
-  Select "WAN Zone" at Firewall Settings page.
-6.使用SSH登陆到openwrt路由器.输入命令 "udhcpc -i eth1" 回车.
-  Login to openwrt router by SSH clent.Input and run command "udhcpc -i eth1" .
-7.当你看到如下内容即为4G上网成功.
-  When you saw screen output line like this,you are already on 4G network.
-
-范例  
-SCREEN SAMPLE
-
-root@OpenWrt:/etc# udhcpc -i eth1
-udhcpc: started, v1.28.4
-udhcpc: sending discover
-udhcpc: sending select for 10.40.162.36
-udhcpc: lease of 10.40.162.36 obtained, lease time 7200
-udhcpc: ifconfig eth1 10.40.162.36 netmask 255.0.0.0 broadcast +
-udhcpc: setting default routers: 10.40.162.37
-
-  
+默认服务禁用，不会自动修改 network 或 firewall 配置。仓库测试使用 mock，不代替真机检查；OpenWrt 18.06.4 及其他固件尚未在硬件上验证。
