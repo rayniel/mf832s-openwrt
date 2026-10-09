@@ -437,19 +437,23 @@ record_failure() {
 	[ "$recover_bad" -ge "$recover_threshold" ] || recover_bad=$((recover_bad + 1))
 }
 
+recovery_ready() {
+	[ "$interrupted" = 0 ] && same_generation &&
+	network_config "$net" && network_status "$net" &&
+	[ "$up" = false ] && [ "$pending" = false ]
+}
+
 recover() {
 	local rc
 	[ "$recover_mode" = cfun_cycle ] &&
 	[ "$recover_bad" -ge "$recover_threshold" ] &&
-	[ "$(now)" -ge "$recover_next" ] &&
-	[ "$interrupted" = 0 ] && same_generation &&
-	network_config "$net" && network_status "$net" || return
+	[ "$(now)" -ge "$recover_next" ] && recovery_ready || return
 	# Rate-limit attempts too, including failed or interrupted cycles.
 	recover_next=$(( $(now) + recover_cooldown ))
 	recover_bad=0
 	transaction_active=1
 	rc=1
-	if begin_transaction && query 'AT+CFUN=0'; then
+	if begin_transaction && recovery_ready && query 'AT+CFUN=0'; then
 		(
 			exec 9>&-
 			exec sleep 2

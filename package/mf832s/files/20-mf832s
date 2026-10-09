@@ -31,6 +31,7 @@
 			/devices/*) path=$(readlink -f "/sys$DEVPATH") || return 0;;
 			*) return 0;;
 		esac
+		[ -d "$path" ] || return 0
 		while [ -n "$path" ] && [ "$path" != /sys ]; do
 			if [ -r "$path/idVendor" ] && [ -r "$path/idProduct" ]; then
 				event_vid=$(hex_id "$(cat "$path/idVendor")") || return 0
