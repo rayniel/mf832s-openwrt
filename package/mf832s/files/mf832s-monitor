@@ -5,19 +5,34 @@ export PATH
 . /lib/functions.sh
 umask 077
 RUN=/var/run/mf832s
+LOCK=/var/run/mf832s.lock
 child=
 owned_device=
 owned_usb=
+owned_generation=
 generation=
 next_try=0
 lease_deadline=0
 interrupted=0
+transaction_active=0
+health_next=0
+health_bad=0
 
 log() { logger -t mf832s "$*"; }
 now() { date +%s; }
 cancel() {
 	interrupted=1
 	[ -z "$child" ] || kill "$child" 2>/dev/null
+}
+
+wake() {
+	if [ "$transaction_active" = 1 ]; then
+		# Duplicate/unrelated events must not starve a valid modem transaction.
+		same_generation && return
+		cancel
+	elif [ -n "$child" ]; then
+		cancel
+	fi
 }
 
 valid_name() {
@@ -53,6 +68,8 @@ load_config() {
 	config_get retry_initial main retry_initial 5
 	config_get retry_max main retry_max 120
 	config_get dhcp_timeout main dhcp_timeout 60
+	config_get health_interval main health_interval 30
+	config_get health_failures main health_failures 3
 	valid_name "$interface" || return 1
 	# APNs cannot inject chat syntax or AT commands; the empty default is allowed.
 	case "$apn" in *[!a-zA-Z0-9._-]*) return 1;; esac
@@ -64,7 +81,9 @@ load_config() {
 	number poll_interval "$poll_interval" 1 300 &&
 	number retry_initial "$retry_initial" 1 300 &&
 	number retry_max "$retry_max" "$retry_initial" 3600 &&
-	number dhcp_timeout "$dhcp_timeout" 5 600 || return 1
+	number dhcp_timeout "$dhcp_timeout" 5 600 &&
+	number health_interval "$health_interval" 5 600 &&
+	number health_failures "$health_failures" 1 10 || return 1
 	[ "$transaction_timeout" -ge "$query_timeout" ] || return 1
 	case "$vid$pid" in *[!0-9a-fA-F]*) return 1;; esac
 	[ "${#vid}" = 4 ] && [ "${#pid}" = 4 ] || return 1
@@ -184,11 +203,14 @@ network_down() {
 	# Never bring down an interface whose configuration or physical owner changed.
 	if network_config "$owned_device" && network_status "$owned_device"; then
 		parent=$(usb_parent "/sys/class/net/$owned_device/device")
-		if [ -z "$parent" ] || [ "$parent" = "$owned_usb" ]; then
+		if [ -z "$parent" ] || {
+			[ "$parent" = "$owned_usb" ] &&
+			[ "$(stamp "$parent" 2>/dev/null)" = "$owned_generation" ]
+		}; then
 			ubus -t 2 call "network.interface.$interface" down >/dev/null 2>&1 || return 1
 		fi
 	fi
-	owned_device='' owned_usb='' lease_deadline=0
+	owned_device='' owned_usb='' owned_generation='' lease_deadline=0
 }
 
 cleanup() {
@@ -197,6 +219,7 @@ cleanup() {
 	[ -z "$child" ] || kill -KILL "$child" 2>/dev/null
 	[ -z "$child" ] || wait "$child" 2>/dev/null
 	network_down
+	# The persistent lock is outside this private directory and is never unlinked.
 	rm -rf "$RUN"
 }
 
@@ -236,7 +259,10 @@ query() {
 		printf "'' '%s'\n'\\\\r\\\\nOK\\\\r\\\\n' ''\n" "$command"
 	} >"$RUN/query.chat"
 	# Transcript is private and never passed to logger (it may contain an APN).
-	chat -S -s -V -f "$RUN/query.chat" <"$at" >"$at" 2>"$RUN/response" &
+	(
+		exec 9>&-
+		exec chat -S -s -V -f "$RUN/query.chat" <"$at" >"$at" 2>"$RUN/response"
+	) &
 	child=$!
 	await_child "$end"
 }
@@ -267,25 +293,78 @@ active() {
 		index($0,prefix) {
 			line=substr($0,index($0,prefix)+length(prefix))
 			gsub(/\r/,"",line); gsub(/ /,"",line)
-			split(line,a,",")
-			if (a[1]==cid && (a[2]=="0" || a[2]=="1")) {
+			n=split(line,a,",")
+			if (n!=2 || a[1]!~/^[0-9]+$/ || (a[2]!="0" && a[2]!="1"))
+				malformed=1
+			if (n==2 && a[1]==cid && (a[2]=="0" || a[2]=="1")) {
 				known=1; if (a[2]=="1") found=1
 			}
 		}
-		END { exit (found ? 0 : (known ? 1 : 2)) }
+		END { exit (found ? 0 : (known ? 1 : (malformed ? 2 : 3))) }
 	' "$RUN/response"
+}
+
+undefined_context() {
+	query 'AT+CGDCONT?' || return 1
+	awk -v cid="$cid" '
+		index($0,"+CGDCONT:") {
+			line=substr($0,index($0,"+CGDCONT:")+9)
+			gsub(/\r/,"",line); gsub(/ /,"",line)
+			n=split(line,a,",")
+			if (a[1]==cid) defined=1
+			if (n<3 || a[1]!~/^[0-9]+$/ ||
+			    a[2]!~/^"[A-Za-z0-9]+"$/ || a[3]!~/^"[^"]*"$/)
+				malformed=1
+		}
+		END { exit (defined || malformed) }
+	' "$RUN/response"
+}
+
+begin_transaction() {
+	transaction_end=$(( $(now) + transaction_timeout ))
+	(
+		exec 9>&-
+		exec stty -F "$at" 115200 raw -echo clocal 2>/dev/null
+	) &
+	child=$!
+	await_child "$transaction_end" || return 1
+	query AT
+}
+
+function_ready() {
+	local state
+	query 'AT+CFUN?' || return 1
+	state=$(awk '
+		/\+CFUN:/ {
+			line=substr($0,index($0,"+CFUN:")+6)
+			gsub(/\r/,"",line); gsub(/ /,"",line)
+			if (line=="0" || line=="1") print line
+		}
+	' "$RUN/response")
+	case "$state" in 1) return 0;; 0) query 'AT+CFUN=1';; *) return 1;; esac
+}
+
+health() {
+	local cg zg
+	begin_transaction && registered || return 1
+	active CGACT; cg=$?
+	active ZGACT; zg=$?
+	[ "$interrupted" = 0 ] && same_generation || return 1
+	[ "$cg" != 1 ] && [ "$zg" != 1 ] &&
+		{ [ "$cg" = 0 ] || [ "$zg" = 0 ]; }
 }
 
 activate() {
 	local cg zg
-	transaction_end=$(( $(now) + transaction_timeout ))
-	stty -F "$at" 115200 raw -echo clocal 2>/dev/null &
-	child=$!
-	await_child "$transaction_end" || return 1
-	query AT && registered || return 1
+	begin_transaction && function_ready && registered || return 1
 	active CGACT; cg=$?
 	active ZGACT; zg=$?
 	[ "$interrupted" = 0 ] && same_generation || return 1
+	# A successfully omitted CID may be new, but only definitions can confirm that.
+	if [ "$cg" = 3 ] && [ "$zg" != 0 ]; then
+		undefined_context || return 1
+		cg=1
+	fi
 	# Unknown CGACT state is not safe to overwrite; retry without changing the APN.
 	[ "$cg" != 2 ] || [ "$zg" = 0 ] || return 1
 	if [ "$cg" != 0 ] && [ "$zg" != 0 ]; then
@@ -307,7 +386,7 @@ retry() {
 }
 
 reconcile() {
-	local previous current
+	local previous current activation_rc
 	previous=$generation
 	if ! discover; then
 		network_down
@@ -319,6 +398,8 @@ reconcile() {
 		network_down || { retry; return; }
 		next_try=0
 		backoff=$retry_initial
+		health_next=0
+		health_bad=0
 	fi
 	network_config "$net" && network_status "$net" || {
 		network_down
@@ -326,10 +407,28 @@ reconcile() {
 	}
 	current=$(now)
 	[ "$current" -ge "$next_try" ] || return
-	# A healthy lease or an existing DHCP attempt needs no AT traffic or restart.
+	# A DHCP lease is not proof that the modem's PDP context is still active.
 	if [ "$up" = true ]; then
-		backoff=$retry_initial
 		lease_deadline=0
+		[ "$current" -ge "$health_next" ] || return
+		transaction_active=1
+		health
+		activation_rc=$?
+		transaction_active=0
+		health_next=$(( $(now) + health_interval ))
+		if [ "$activation_rc" = 0 ]; then
+			health_bad=0
+			backoff=$retry_initial
+		else
+			health_bad=$((health_bad + 1))
+			if [ "$health_bad" -ge "$health_failures" ]; then
+				# An interface that we did not start must never be cycled.
+				network_down
+				retry
+				health_bad=0
+				log 'Repeated modem health failures; backing off'
+			fi
+		fi
 		return
 	fi
 	if [ "$pending" = true ]; then
@@ -350,7 +449,11 @@ reconcile() {
 		log 'DHCP lease failed; backing off'
 		return
 	fi
-	if ! activate; then
+	transaction_active=1
+	activate
+	activation_rc=$?
+	transaction_active=0
+	if [ "$activation_rc" != 0 ]; then
 		retry
 		[ "$interrupted" = 1 ] || log 'Registration or activation incomplete; backing off'
 		return
@@ -360,7 +463,10 @@ reconcile() {
 	if ubus -t 2 call "network.interface.$interface" up >/dev/null 2>&1; then
 		owned_device=$net
 		owned_usb=$usb
+		owned_generation=$generation
 		lease_deadline=$(( $(now) + dhcp_timeout ))
+		health_next=$(( $(now) + health_interval ))
+		health_bad=0
 		log 'PDP activated; waiting for netifd DHCP'
 	else
 		retry
@@ -368,36 +474,25 @@ reconcile() {
 }
 
 load_config || { log 'Disabled or invalid configuration (explicit AT selection required)'; exit 1; }
-for tool in chat stty ubus jsonfilter; do
+for tool in chat stty ubus jsonfilter flock; do
 	command -v "$tool" >/dev/null 2>&1 || { log "Required tool missing: $tool"; exit 1; }
 done
-# mkdir is the lock; a live owner is never replaced, even before its pid is written.
-if ! mkdir "$RUN" 2>/dev/null; then
-	[ -r "$RUN/pid" ] || exit 1
-	read -r owner <"$RUN/pid"
-	case "$owner" in ''|*[!0-9]*) exit 1;; esac
-	kill -0 "$owner" 2>/dev/null && exit 0
-	# Serialize stale-lock recovery, then recheck in case another monitor won.
-	mkdir "$RUN/reap" 2>/dev/null || exit 1
-	if ! read -r owner <"$RUN/pid"; then
-		rmdir "$RUN/reap"
-		exit 1
-	fi
-	if kill -0 "$owner" 2>/dev/null; then
-		rmdir "$RUN/reap"
-		exit 0
-	fi
-	rm -f "$RUN/pid" "$RUN/query.chat" "$RUN/response"
-	rmdir "$RUN/reap" && rmdir "$RUN" && mkdir "$RUN" || exit 1
-fi
+# The kernel releases this persistent inode's lock even on a monitor crash.
+exec 9>"$LOCK" || exit 1
+flock -n 9 || exit 0
+rm -rf "$RUN"
+mkdir "$RUN" || exit 1
 printf '%s\n' "$$" >"$RUN/pid"
 trap 'cleanup; exit 0' TERM INT
-trap cancel USR1
+trap wake USR1
 while :; do
 	interrupted=0
 	reconcile
 	# Events cancel work but do not reset backoff; polling catches missed events.
-	sleep "$poll_interval" &
+	(
+		exec 9>&-
+		exec sleep "$poll_interval"
+	) &
 	child=$!
 	wait "$child" 2>/dev/null
 	child=

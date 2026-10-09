@@ -1,0 +1,15 @@
+#!/bin/sh
+
+# Hotplug files are sourced: keep variables and control flow in a subshell.
+(
+	case "$ACTION" in
+		add|remove|bind|unbind)
+			signal=$(kill -l USR1 2>/dev/null)
+			case "$signal" in
+				''|*[!0-9]*) :;;
+				*) ubus -t 1 call service signal "{\"name\":\"mf832s\",\"signal\":$signal}" >/dev/null 2>&1;;
+			esac
+			;;
+	esac
+	:
+)

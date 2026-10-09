@@ -61,8 +61,13 @@ flock 提供崩溃后自动释放的单实例锁，不使用容易遗留的 mkdi
 
 保留仓库布局：Makefile 的 Build/Prepare 从 ../../LICENSE 复制许可证。
 例如将完整仓库放到 SDK 的 package/mf832s-openwrt/；不要只复制内层包目录。
-安装并配置目标平台官方 SDK，更新其 feeds，在 menuconfig 的 Network / WWAN
-选择 mf832s，随后使用 SDK 标准包目标构建：
+安装并配置目标平台官方 SDK，使用该分支配套的 feeds：
+
+  ./scripts/feeds update packages
+  ./scripts/feeds install coreutils
+
+coreutils-stty 来自 packages feed，其余直接依赖来自 OpenWrt 基础源码。
+在 menuconfig 的 Network / WWAN 选择 mf832s，随后使用 SDK 标准包目标构建：
 
   make package/mf832s-openwrt/package/mf832s/compile V=s
 
@@ -122,6 +127,8 @@ auto=0 使本服务在 AT 激活成功后启动接口，避免开机竞态。
   retry_initial       5          初始退避，秒（1..300）
   retry_max           120        最大退避，秒（不小于初始值，最大 3600）
   dhcp_timeout        60         租约等待窗口，秒（5..600）
+  health_interval     30         已获租约后的 AT 健康检查间隔，秒（5..600）
+  health_failures     3          连续失败阈值（1..10），仅重启本服务启动的接口
 
 transaction_timeout 不得小于 query_timeout。多设备筛选结果、所选 AT 口或
 网卡存在歧义时拒绝连接。at_interface 和 at_device 同时设置时均须匹配。
@@ -141,15 +148,22 @@ APN 仅接受字母、数字、点、下划线、连字符；不允许 AT/chat �
 ------------------
 服务启动扫描已经插入的设备；USB/net 事件经 procd 唤醒检查，
 通知丢失时周期扫描仍可恢复。通知不会在 hotplug 中执行 AT、等待注册或 DHCP。
+通知信号按目标系统解析 USR1 编号，不假定所有架构都使用信号 10。
 AT 操作串行执行并有超时；注册通过主动查询判断本地/漫游状态，
 不依赖两次 +CREG 通知或要求所有注册查询都支持。
 PDP 已激活时不重复写 CGDCONT。只有激活路径使用 ZTE AT+ZGACT，
 需要在实际固件上验证，不能当作通用蜂窝协议。
+AT+CFUN? 确认射频关闭时才启用射频，不反复重置已经启用的调制解调器。
+已有 DHCP 租约也会周期检查注册/PDP；连续失败达到阈值后才对拥有的接口重连。
 
 procd respawn 只恢复进程崩溃；网络失败使用有上限的退避间隔重试。
 设备消失/代次变化取消旧串口任务；DHCP 由 netifd 管理，没有第二个 udhcpc。
 AT 激活、DHCP pending、已获地址不是同一状态，公网探测不作为断网重置依据。
 停止/reload 取消本服务子任务；不会删除用户网络或防火墙配置。
+运行目录 /var/run/mf832s 权限为 0700；停止时删除目录及 PID、chat 和响应文件。
+独立的 /var/run/mf832s.lock 权限为 0600，保留到重启，
+以防删除锁 inode 导致两个实例分别持锁；
+锁由内核在进程退出时释放，残留文件不是仍在运行的服务。
 
   logread -e mf832s
   ubus call service list '{"name":"mf832s"}'
@@ -168,6 +182,7 @@ AT 激活、DHCP pending、已获地址不是同一状态，公网探测不作�
 - 开机前/后插入，串口/网卡延迟出现，重命名，多 USB 设备和错误 AT 口。
 - 重复事件、快速拔插、AT/注册/DHCP 期间拔出、stop/reload 清理。
 - 超时、SIM 不就绪、APN 错误、本地/漫游注册及不支持的注册查询。
+- 未定义 CID 可安全初始化；查询失败或格式不明时不能覆盖可能活动的 PDP。
 - PDP 已激活但逻辑接口未启动；DHCP 无响应、续租和租约恢复。
 - 非 MF832S 事件不影响后续 hotplug 处理器；设备关联失败时拒绝操作。
 - 非 DHCP、网卡不匹配或用户网络配置改变时不操作其他接口。
