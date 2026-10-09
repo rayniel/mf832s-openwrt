@@ -1,0 +1,8 @@
+config mf832s 'main'
+	option enabled '0'
+	option vendor '19d2'
+	option product '0199'
+	option at_port ''
+	option network 'mf832s'
+	option data_device ''
+	option apn ''

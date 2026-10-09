@@ -1,16 +1,10 @@
 ABORT   BUSY
 ABORT   "NO CARRIER"
-ABORT   "ERROR\r"
-REPORT  CONNECT
-TIMEOUT 1
+ABORT   ERROR
+TIMEOUT 5
 ''      "AT"
 OK      'AT+CGDCONT=1,"IPV4V6","","",0,0'
-OK      "AT+CFUN=1"
-OK      ''
 TIMEOUT 30
-+CREG:  \d\d\d\d\d\d\d\d\d\d\d\d\d\d\d
-+CREG:  "AT+CGATT=1"
+OK      "AT+CGATT=1"
 OK      "AT+CGACT=1,1"
-OK      "AT+ZGACT=1,1"
-OK      "AT+CGPADDR=1"
 OK      ''

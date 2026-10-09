@@ -1,0 +1,324 @@
+#!/bin/sh
+
+SYS_USB_ROOT=${MF832S_SYS_USB_ROOT:-/sys/bus/usb/devices}
+SYS_TTY_ROOT=${MF832S_SYS_TTY_ROOT:-/sys/class/tty}
+SYS_NET_ROOT=${MF832S_SYS_NET_ROOT:-/sys/class/net}
+DEV_ROOT=${MF832S_DEV_ROOT:-/dev}
+RUN_DIR=${MF832S_RUN_DIR:-/var/run/mf832s}
+POLL_INTERVAL=10
+HEALTH_INTERVAL=30
+DHCP_WAIT=90
+RETRY_BASE=15
+RETRY_MAX=300
+MAX_FAILURES=8
+AT_TIMEOUT=3
+
+log() {
+	logger -t mf832s "$*" 2>/dev/null || :
+}
+
+uci_value() {
+	uci -q get "mf832s.main.$1" 2>/dev/null
+}
+
+valid_name() {
+	case "$1" in
+		''|*[!A-Za-z0-9_.-]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+load_config() {
+	ENABLED=$(uci_value enabled)
+	VENDOR=$(uci_value vendor)
+	PRODUCT_ID=$(uci_value product)
+	AT_PORT=$(uci_value at_port)
+	NETIF=$(uci_value network)
+	DATA_DEVICE=$(uci_value data_device)
+	APN=$(uci_value apn)
+
+	[ "$ENABLED" = 1 ] || return 1
+	case "$VENDOR:$PRODUCT_ID" in
+		[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) ;;
+		*) log "invalid USB vendor/product configuration"; return 1 ;;
+	esac
+	case "$AT_PORT" in
+		/dev/ttyUSB[0-9]*) ;;
+		*) log "set main.at_port to the MF832S AT serial port"; return 1 ;;
+	esac
+	case "$AT_PORT" in
+		/dev/ttyUSB*[!0-9]*) log "invalid AT port"; return 1 ;;
+	esac
+	valid_name "$NETIF" && valid_name "$DATA_DEVICE" || {
+		log "set valid main.network and main.data_device values"
+		return 1
+	}
+	case "$APN" in
+		*[!A-Za-z0-9._-]*|'') [ -z "$APN" ] || {
+			log "APN may contain only letters, digits, dot, underscore, and hyphen"
+			return 1
+		} ;;
+		*) [ "${#APN}" -le 100 ] || {
+			log "APN is too long"
+			return 1
+		} ;;
+	esac
+	VENDOR=$(printf '%s' "$VENDOR" | tr 'A-F' 'a-f')
+	PRODUCT_ID=$(printf '%s' "$PRODUCT_ID" | tr 'A-F' 'a-f' | sed 's/^0*//')
+	[ -n "$PRODUCT_ID" ] || PRODUCT_ID=0
+	NETIF_OBJECT="network.interface.$NETIF"
+	return 0
+}
+
+canonical() {
+	readlink -f "$1" 2>/dev/null
+}
+
+is_under_root() {
+	_path=$(canonical "$1") || return 1
+	case "$_path" in
+		"$USB_ROOT"|"$USB_ROOT"/*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+find_usb_root() {
+	USB_ROOT=
+	for _candidate in "$SYS_USB_ROOT"/*; do
+		[ -r "$_candidate/idVendor" ] && [ -r "$_candidate/idProduct" ] || continue
+		_candidate_vendor=$(cat "$_candidate/idVendor" 2>/dev/null | tr 'A-F' 'a-f')
+		_candidate_product=$(cat "$_candidate/idProduct" 2>/dev/null | tr 'A-F' 'a-f' | sed 's/^0*//')
+		[ -n "$_candidate_product" ] || _candidate_product=0
+		[ "$_candidate_vendor" = "$VENDOR" ] && [ "$_candidate_product" = "$PRODUCT_ID" ] || continue
+		[ -z "$USB_ROOT" ] || {
+			USB_ROOT=
+			return 2
+		}
+		USB_ROOT=$(canonical "$_candidate") || USB_ROOT=
+	done
+	[ -n "$USB_ROOT" ]
+}
+
+serial_ready() {
+	[ -c "$DEV_ROOT/${AT_PORT#/dev/}" ] || return 1
+	[ -e "$SYS_TTY_ROOT/${AT_PORT##*/}/device" ] || return 1
+	is_under_root "$SYS_TTY_ROOT/${AT_PORT##*/}/device"
+}
+
+network_device_ready() {
+	[ -e "$SYS_NET_ROOT/$DATA_DEVICE/device" ] || return 1
+	is_under_root "$SYS_NET_ROOT/$DATA_DEVICE/device"
+}
+
+interface_has_lease() {
+	_status=$(ubus call "$NETIF_OBJECT" status 2>/dev/null) || return 1
+	printf '%s\n' "$_status" | grep -Eq '"up"[[:space:]]*:[[:space:]]*true' || return 1
+	printf '%s\n' "$_status" | grep -Eq '"ipv4-address"[[:space:]]*:[[:space:]]*\[[^]]' 
+}
+
+netif_up() {
+	ubus call "$NETIF_OBJECT" up >/dev/null 2>&1
+}
+
+netif_down() {
+	ubus call "$NETIF_OBJECT" down >/dev/null 2>&1
+}
+
+at_registration() {
+	AT_RESPONSE=
+	[ -c "$DEV_ROOT/${AT_PORT#/dev/}" ] || return 1
+	exec 3<> "$DEV_ROOT/${AT_PORT#/dev/}" || return 1
+	printf 'AT+CREG?\r' >&3 || {
+		exec 3>&- 3<&-
+		return 1
+	}
+	AT_CREG=
+	AT_GOT_OK=0
+	AT_DEADLINE=$AT_TIMEOUT
+	while [ "$AT_DEADLINE" -gt 0 ]; do
+		AT_LINE=
+		read -r -t "$AT_TIMEOUT" AT_LINE <&3 || break
+		AT_LINE=${AT_LINE%$(printf '\r')}
+		case "$AT_LINE" in
+			+CREG:*) AT_CREG=$AT_LINE ;;
+			OK) AT_GOT_OK=1; break ;;
+			ERROR|"+CME ERROR:"*|"+CMS ERROR:"*) break ;;
+		esac
+	done
+	exec 3>&- 3<&-
+	[ "$AT_GOT_OK" = 1 ] && [ -n "$AT_CREG" ] || return 1
+	AT_STATUS=$(printf '%s\n' "$AT_CREG" | sed -n \
+		's/^+CREG:[[:space:]]*[0-9][[:space:]]*,[[:space:]]*\([0-9][0-9]*\).*$/\1/p; s/^+CREG:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p')
+	case "$AT_STATUS" in
+		1|5) return 0 ;;
+		0|2|3|4) return 2 ;;
+		*) return 1 ;;
+	esac
+}
+
+activate_pdp() {
+	CHAT_FILE="$RUN_DIR/connect.chat"
+	{
+		printf '%s\n' 'ABORT BUSY' 'ABORT "NO CARRIER"' 'ABORT ERROR' 'TIMEOUT 5'
+		printf '%s\n' "'' AT" "OK 'AT+CGDCONT=1,\"IPV4V6\",\"$APN\"'" 'TIMEOUT 30'
+		printf '%s\n' 'OK "AT+CGATT=1"' 'OK "AT+CGACT=1,1"' "OK ''"
+	} >"$CHAT_FILE" || return 1
+	chat -f "$CHAT_FILE" <"$DEV_ROOT/${AT_PORT#/dev/}" >"$DEV_ROOT/${AT_PORT#/dev/}" &
+	CHAT_PID=$!
+	wait "$CHAT_PID"
+	_CHAT_RESULT=$?
+	CHAT_PID=
+	rm -f "$CHAT_FILE"
+	return "$_CHAT_RESULT"
+}
+
+bounded_retry_delay() {
+	_delay=$RETRY_BASE
+	_n=1
+	while [ "$_n" -lt "$FAILURES" ] && [ "$_delay" -lt "$RETRY_MAX" ]; do
+		_delay=$((_delay * 2))
+		[ "$_delay" -le "$RETRY_MAX" ] || _delay=$RETRY_MAX
+		_n=$((_n + 1))
+	done
+	printf '%s\n' "$_delay"
+}
+
+record_failure() {
+	FAILURES=$((FAILURES + 1))
+	[ "$FAILURES" -le "$MAX_FAILURES" ] || FAILURES=$MAX_FAILURES
+	RETRY_AT=$(($(date +%s) + $(bounded_retry_delay)))
+	log "reconnect attempt failed ($FAILURES/$MAX_FAILURES); retry delayed"
+}
+
+reset_connection_state() {
+	DEVICE_KEY=
+	NETWORK_REQUESTED=0
+	DHCP_DEADLINE=0
+	FAILURES=0
+	RETRY_AT=0
+	NEXT_HEALTH=0
+}
+
+process_once() {
+	NOW=${1:-$(date +%s)}
+	if ! find_usb_root; then
+		if [ -n "$DEVICE_KEY" ]; then
+			[ "$NETWORK_REQUESTED" = 1 ] && netif_down
+			log "matching MF832S removed; managed interface down"
+			reset_connection_state
+		fi
+		return 0
+	fi
+	if [ "$USB_ROOT" != "$DEVICE_KEY" ]; then
+		if [ -n "$DEVICE_KEY" ] && [ "$NETWORK_REQUESTED" = 1 ]; then
+			netif_down
+		fi
+		DEVICE_KEY=$USB_ROOT
+		NETWORK_REQUESTED=0
+		DHCP_DEADLINE=0
+		FAILURES=0
+		RETRY_AT=0
+		NEXT_HEALTH=0
+		log "matching MF832S found; waiting for configured ports"
+	fi
+	if ! serial_ready || ! network_device_ready; then
+		READY=0
+		return 0
+	fi
+	if [ "$NETWORK_REQUESTED" = 0 ]; then
+		netif_up || {
+			record_failure
+			return 1
+		}
+		NETWORK_REQUESTED=1
+		DHCP_DEADLINE=$((NOW + DHCP_WAIT))
+		NEXT_HEALTH=$NOW
+		log "netifd interface requested; waiting for DHCP lease"
+	fi
+	if interface_has_lease; then
+		if [ "$FAILURES" -gt 0 ]; then
+			log "netifd lease restored; reconnect backoff reset"
+		fi
+		FAILURES=0
+		RETRY_AT=0
+	fi
+	[ "$NOW" -ge "$NEXT_HEALTH" ] || return 0
+	NEXT_HEALTH=$((NOW + HEALTH_INTERVAL))
+	at_registration
+	_AT_STATE=$?
+	if [ "$_AT_STATE" -eq 0 ]; then
+		if interface_has_lease; then
+			return 0
+		fi
+		[ "$NOW" -ge "$DHCP_DEADLINE" ] || return 0
+		[ "$NOW" -ge "$RETRY_AT" ] || return 0
+		activate_pdp || {
+			record_failure
+			return 1
+		}
+		FAILURES=0
+		RETRY_AT=$((NOW + RETRY_BASE))
+		DHCP_DEADLINE=$((NOW + DHCP_WAIT))
+		log "PDP activation requested; allowing netifd to obtain a lease"
+	elif [ "$_AT_STATE" -eq 2 ]; then
+		[ "$NOW" -lt "$DHCP_DEADLINE" ] || {
+			DHCP_DEADLINE=$((NOW + DHCP_WAIT))
+			log "modem is not registered; waiting without resetting it"
+		}
+	else
+		[ "$NOW" -lt "$DHCP_DEADLINE" ] && return 0
+		[ "$NOW" -ge "$RETRY_AT" ] || return 0
+		record_failure
+	fi
+	return 0
+}
+
+cleanup() {
+	STOPPING=1
+	if [ -n "$CHAT_PID" ]; then
+		kill "$CHAT_PID" 2>/dev/null || :
+		wait "$CHAT_PID" 2>/dev/null || :
+		CHAT_PID=
+	fi
+	if [ "$NETWORK_REQUESTED" = 1 ]; then
+		netif_down
+		NETWORK_REQUESTED=0
+	fi
+	[ -n "$LOCK_DIR" ] && rm -rf "$LOCK_DIR"
+}
+
+worker_main() {
+	load_config || return 0
+	mkdir -p "$RUN_DIR" || return 1
+	LOCK_DIR="$RUN_DIR/worker.lock"
+	if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+		_LOCK_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+		case "$_LOCK_PID" in
+			''|*[!0-9]*) ;;
+			*) kill -0 "$_LOCK_PID" 2>/dev/null && return 0 ;;
+		esac
+		rm -rf "$LOCK_DIR"
+		mkdir "$LOCK_DIR" 2>/dev/null || return 0
+	fi
+	printf '%s\n' "$$" >"$LOCK_DIR/pid"
+	DEVICE_KEY=
+	NETWORK_REQUESTED=0
+	FAILURES=0
+	RETRY_AT=0
+	NEXT_HEALTH=0
+	CHAT_PID=
+	STOPPING=0
+	trap cleanup EXIT
+	trap 'STOPPING=1' INT TERM
+	log "monitor started"
+	while [ "$STOPPING" = 0 ]; do
+		process_once || :
+		sleep "$POLL_INTERVAL" &
+		_SLEEP_PID=$!
+		wait "$_SLEEP_PID" || :
+	done
+}
+
+if [ "${1:-}" = worker ]; then
+	worker_main
+fi

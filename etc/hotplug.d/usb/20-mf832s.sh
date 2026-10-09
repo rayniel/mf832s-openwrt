@@ -1,34 +1,31 @@
 #!/bin/sh
 
-MF832S_PRODUCT="19d2/199/100"
-MODEM=/dev/ttyUSB0
-NETIF=network.interface.mf832s
+uci -q get mf832s.main.enabled 2>/dev/null | grep -qx 1 || exit 0
 
-[ "$PRODUCT" = "$MF832S_PRODUCT" ] && [ "${DEVICENAME##*.}" = "4" ] || exit
+VENDOR=$(uci -q get mf832s.main.vendor 2>/dev/null)
+PRODUCT_ID=$(uci -q get mf832s.main.product 2>/dev/null)
+case "$VENDOR:$PRODUCT_ID:$PRODUCT" in
+	[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]:*) ;;
+	*) exit 0 ;;
+esac
+case "$ACTION" in
+	add|remove) ;;
+	*) exit 0 ;;
+esac
 
-[ "$ACTION" = "remove" ] &&\
-    { logger -t hotplug "MF832S: detach" &&\
-    sleep 3 &&\
-    ubus call $NETIF status | grep available | grep false &&\
-    logger -t hotplug "MF832S: $NETIF down" &&\
-    ubus call $NETIF down ||\
-    exit ; }
+EVENT_VENDOR=${PRODUCT%%/*}
+EVENT_PRODUCT=${PRODUCT#*/}
+EVENT_PRODUCT=${EVENT_PRODUCT%%/*}
+VENDOR=$(printf '%s' "$VENDOR" | tr 'A-F' 'a-f')
+PRODUCT_ID=$(printf '%s' "$PRODUCT_ID" | tr 'A-F' 'a-f')
+EVENT_VENDOR=$(printf '%s' "$EVENT_VENDOR" | tr 'A-F' 'a-f')
+EVENT_PRODUCT=$(printf '%s' "$EVENT_PRODUCT" | tr 'A-F' 'a-f')
+EVENT_PRODUCT=$(printf '%s' "$EVENT_PRODUCT" | sed 's/^0*//')
+PRODUCT_ID=$(printf '%s' "$PRODUCT_ID" | sed 's/^0*//')
+[ "$PRODUCT_ID" = "" ] && PRODUCT_ID=0
+[ "$EVENT_PRODUCT" = "" ] && EVENT_PRODUCT=0
+[ "$VENDOR" = "$EVENT_VENDOR" ] && [ "$PRODUCT_ID" = "$EVENT_PRODUCT" ] || exit 0
 
-[ "$ACTION" = "add" ] &&\
-    { logger -t hotplug "MF832S: attach" &&\
-    [ -c $MODEM ] &&\
-        { logger -t hotplug "MF832S: test" &&\
-        chat -f /etc/chatscripts/mf832s-online-test.chat <$MODEM >$MODEM &&\
-        logger -t hotplug "MF832S: online" ; } ||\
-        { logger -t hotplug "MF832S: offline" &&\
-        logger -t hotplug "MF832S: $MODEM chat" &&\
-        chat -f /etc/chatscripts/mf832s.chat <$MODEM >$MODEM &&\
-        logger -t hotplug "MF832S: $MODEM chat success" &&\
-        ubus call $NETIF status | grep available | grep true &&\
-        logger -t hotplug "MF832S: $NETIF up" &&\
-        ubus call $NETIF up ; } ||\
-        logger -t hotplug "MF832S: $MODEM chat fail" ||\
-    exit ; }
-ifconfig eth1 up
-sleep 20s
-udhcpc -i eth1
+mkdir -p /var/run/mf832s 2>/dev/null || exit 0
+touch /var/run/mf832s/event
+exit 0
