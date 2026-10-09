@@ -1,7 +1,8 @@
 #!/bin/sh
 
+# shellcheck disable=SC2218 # The worker functions are loaded by sourcing the monitor.
 set -eu
-ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 export MF832S_SYS_USB_ROOT="$TMP/sys/bus/usb/devices"
@@ -27,8 +28,11 @@ LEASE=0
 REGISTRATION=1
 PDP_RESULT=0
 PDP_CALLS=0
-CHAT_CALLS=0
 CONFIG_ENABLED=1
+CONFIG_APN=test.apn
+INTERFACE_UP=0
+STATUS_MODE=normal
+NETWORK_PROTO=dhcp
 
 reset_state() {
 	DEVICE_KEY=
@@ -64,14 +68,14 @@ uci_value() {
 		at_port) printf '/dev/ttyUSB2\n' ;;
 		network) printf 'cellular\n' ;;
 		data_device) printf 'wwan0\n' ;;
-		apn) printf 'test.apn\n' ;;
+		apn) printf '%s\n' "$CONFIG_APN" ;;
 		*) return 1 ;;
 	esac
 }
 
 uci() {
 	case "$*" in
-		*"network.cellular.proto"*) printf 'dhcp\n' ;;
+		*"network.cellular.proto"*) printf '%s\n' "$NETWORK_PROTO" ;;
 		*"network.cellular.device"*) printf 'wwan0\n' ;;
 		*) return 1 ;;
 	esac
@@ -84,14 +88,18 @@ is_char_device() {
 ubus() {
 	case "$*" in
 		*" status"*)
-			if [ "$LEASE" = 1 ]; then
+			if [ "$STATUS_MODE" = invalid ]; then
+				printf 'not-json\n'
+			elif [ "$LEASE" = 1 ]; then
 				printf '{"up":true,"ipv4-address":[{"address":"192.0.2.2"}]}\n'
+			elif [ "$INTERFACE_UP" = 1 ]; then
+				printf '{"up":true,"ipv4-address":[]}\n'
 			else
 				printf '{"up":false,"ipv4-address":[]}\n'
 			fi
 			;;
-		*" up") USB_CALLS="${USB_CALLS}up " ;;
-		*" down") USB_CALLS="${USB_CALLS}down " ;;
+		*" up") INTERFACE_UP=1; USB_CALLS="${USB_CALLS}up " ;;
+		*" down") INTERFACE_UP=0; USB_CALLS="${USB_CALLS}down " ;;
 		*) return 1 ;;
 	esac
 }
@@ -126,12 +134,27 @@ reset_state
 process_once 100
 [ -z "$USB_CALLS" ] || fail "unrelated USB device touched netifd"
 
-# Discover an already-inserted device and wait for late serial/network nodes.
-rm -rf "$MF832S_SYS_USB_ROOT/2-1"
+# Multiple devices with the configured identity are ambiguous and fail closed.
 make_device
+mkdir -p "$MF832S_SYS_USB_ROOT/3-1"
+printf '19d2\n' >"$MF832S_SYS_USB_ROOT/3-1/idVendor"
+printf '0199\n' >"$MF832S_SYS_USB_ROOT/3-1/idProduct"
+printf '1\n' >"$MF832S_SYS_USB_ROOT/3-1/busnum"
+printf '8\n' >"$MF832S_SYS_USB_ROOT/3-1/devnum"
+reset_state
+process_once 105
+[ -z "$USB_CALLS" ] || fail "ambiguous modem identity touched netifd"
+rm -rf "$MF832S_SYS_USB_ROOT/3-1"
+
+# Discover an already-inserted device and wait for late serial/network nodes.
 reset_state
 process_once 100
 [ "$NETWORK_REQUESTED" = 0 ] || fail "worker acted before ports were ready"
+make_ports
+# Both configured endpoint names must resolve beneath the matching USB device.
+ln -sfn "$MF832S_SYS_USB_ROOT/2-1" "$MF832S_SYS_TTY_ROOT/ttyUSB2/device"
+process_once 105
+[ "$NETWORK_REQUESTED" = 0 ] || fail "unrelated AT port was accepted"
 make_ports
 process_once 110
 [ "$USB_CALLS" = "up " ] || fail "ready startup device did not request netifd"
@@ -152,6 +175,9 @@ LEASE=1
 REGISTRATION=5
 process_once 350
 [ "$FAILURES" -eq 0 ] || fail "healthy lease did not reset failure count"
+STATUS_MODE=invalid
+interface_has_lease && fail "malformed ubus status was treated as a lease"
+STATUS_MODE=normal
 
 # Unregistered or malformed AT status never causes destructive reinitialization.
 LEASE=0
@@ -187,8 +213,15 @@ assert test "$RETRY_AT" -gt 590
 CONFIG_ENABLED=0
 BEFORE_CALLS=$USB_CALLS
 load_config && fail "disabled configuration was accepted"
+worker_main
 [ "$USB_CALLS" = "$BEFORE_CALLS" ] || fail "disabled configuration touched netifd"
 CONFIG_ENABLED=1
+NETWORK_PROTO=unmanaged
+load_config && fail "unmanaged interface configuration was accepted"
+NETWORK_PROTO=dhcp
+CONFIG_APN='bad;command'
+load_config && fail "unsafe APN was accepted"
+CONFIG_APN=test.apn
 
 # A live lock prevents a second worker from starting.
 mkdir -p "$MF832S_RUN_DIR/worker.lock"
@@ -201,5 +234,16 @@ worker_main
 NETWORK_REQUESTED=1
 cleanup
 case "$USB_CALLS" in *"down "*) ;; *) fail "stop did not clean up managed interface" ;; esac
+
+# A dead PID lock can be reclaimed without deleting another worker's lock.
+mkdir -p "$MF832S_RUN_DIR/worker.lock"
+printf '99999999\n' >"$MF832S_RUN_DIR/worker.lock/pid"
+POLL_INTERVAL=0
+process_once() {
+	STOPPING=1
+}
+worker_main
+cleanup
+[ ! -e "$MF832S_RUN_DIR/worker.lock" ] || fail "stale worker lock was not cleaned up"
 
 printf 'ok - monitor state paths\n'

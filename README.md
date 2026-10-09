@@ -19,10 +19,11 @@
 
 ## 安装和配置
 
-先备份现有配置及同名文件。根据固件的网络语法，先创建一个**专用** DHCP interface；以下 `wwan0` 仅是示例，必须替换为实际设备名：
+先备份现有配置及同名文件。若 `/etc/config/mf832s` 已存在，不要覆盖；检查后手动合并本仓库的 `main` 默认项。根据固件的网络语法，先创建一个**专用** DHCP interface；以下 `wwan0` 仅是示例，必须替换为实际设备名：
 
 ```sh
 cp -a /etc/config/network /root/network.before-mf832s
+test -e /etc/config/mf832s || cp etc/config/mf832s /etc/config/mf832s
 uci set network.mf832s=interface
 uci set network.mf832s.proto='dhcp'
 # 较新的 netifd 配置：
@@ -34,15 +35,15 @@ uci commit network
 
 不要把 `mf832s` 配成 `unmanaged`，不要把现有 WAN 或桥接接口改给本服务，也不要仅为安装本服务更改防火墙。需要将该出口加入某个 zone 时，请先审阅并单独配置防火墙策略。
 
-复制文件（仓库根目录执行；先按设备实际位置检查网络配置）：
+自动服务运行时会在 `/var/run/mf832s/` 生成带有已校验 APN 的临时 chat 序列；仓库中的静态 chatscript 仅供兼容旧的手工测试，不参与 worker 的在线判定。
+
+复制服务文件（仓库根目录执行；先按设备实际位置检查网络配置）：
 
 ```sh
 cp etc/config/mf832s /etc/config/mf832s
 cp etc/hotplug.d/usb/20-mf832s.sh /etc/hotplug.d/usb/20-mf832s.sh
 cp etc/init.d/mf832s-monitor /etc/init.d/mf832s-monitor
 cp usr/sbin/mf832s-monitor /usr/sbin/mf832s-monitor
-cp etc/chatscripts/mf832s.chat /etc/chatscripts/mf832s.chat
-cp etc/chatscripts/mf832s-online-test.chat /etc/chatscripts/mf832s-online-test.chat
 chmod 755 /etc/hotplug.d/usb/20-mf832s.sh /etc/init.d/mf832s-monitor /usr/sbin/mf832s-monitor
 ```
 
@@ -53,11 +54,11 @@ uci set mf832s.main.enabled='1'
 uci set mf832s.main.at_port='/dev/ttyUSB2'   # 替换为已确认的 AT 端口
 uci set mf832s.main.network='mf832s'
 uci set mf832s.main.data_device='wwan0'      # 替换为 network.mf832s 绑定的同一网卡
-uci set mf832s.main.apn='your.apn'           # 按运营商要求填写；留空表示使用空 APN/设备默认配置
+uci set mf832s.main.apn='your.apn'           # 按运营商要求填写；留空则保留 modem 已配置的 APN
 uci commit mf832s
 ```
 
-默认 `enabled=0`、AT 端口和数据设备为空；未完成显式配置时服务不接管网络。`network`、`data_device`、USB ID 和 APN 会校验；服务还会验证 `network.<name>` 是绑定到该设备的 DHCP interface。18.06 等旧版使用 `ifname`，较新版使用 `device`；必须与目标设备配置一致。配置发生变化后重启服务：
+默认 `enabled=0`、AT 端口和数据设备为空；未完成显式配置时服务不接管网络。`network`、`data_device`、USB ID 和 APN 会校验；服务还会验证 `network.<name>` 是绑定到该设备的 DHCP interface。APN 在 context 未激活时才设置；服务不会为了应用 APN 而断开已有 context。18.06 等旧版使用 `ifname`，较新版使用 `device`；必须与目标设备配置一致。配置发生变化后重启服务：
 
 ```sh
 /etc/init.d/mf832s-monitor enable
@@ -99,6 +100,7 @@ sh -n etc/init.d/mf832s-monitor
 sh -n usr/sbin/mf832s-monitor
 sh tests/test-hotplug.sh
 sh tests/test-monitor.sh
+sh tests/test-chat-cancel.sh
 ```
 
-这些 mock 覆盖设备过滤、启动时已插入、节点晚就绪、netifd DHCP 等待、注册状态、退避恢复、重插身份变化、单实例、停止清理及禁用配置；通过仅表明模拟状态路径正常，不代表真机兼容性。
+这些 mock 覆盖设备过滤、启动时已插入、节点晚就绪、netifd DHCP 等待、注册状态、退避恢复、重插身份变化、单实例、停止清理、禁用配置和拔出时取消 chat；通过仅表明模拟状态路径正常，不代表真机兼容性。

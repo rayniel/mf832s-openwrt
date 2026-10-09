@@ -3,7 +3,6 @@ ABORT   "NO CARRIER"
 ABORT   ERROR
 TIMEOUT 5
 ''      "AT"
-OK      'AT+CGDCONT=1,"IPV4V6","","",0,0'
 TIMEOUT 30
 OK      "AT+CGATT=1"
 OK      "AT+CGACT=1,1"

@@ -14,7 +14,15 @@ MAX_FAILURES=8
 AT_TIMEOUT=3
 
 log() {
-	logger -t mf832s "$*" 2>/dev/null || :
+	_message=$*
+	_log_time=$(date +%s)
+	if [ "$_message" = "${LAST_LOG_MESSAGE:-}" ] &&
+		[ $((_log_time - ${LAST_LOG_TIME:-0})) -lt 60 ]; then
+		return
+	fi
+	LAST_LOG_MESSAGE=$_message
+	LAST_LOG_TIME=$_log_time
+	logger -t mf832s "$_message" 2>/dev/null || :
 }
 
 uci_value() {
@@ -23,7 +31,7 @@ uci_value() {
 
 valid_name() {
 	case "$1" in
-		''|*[!A-Za-z0-9_.-]*) return 1 ;;
+		''|.|..|*[!A-Za-z0-9_.-]*) return 1 ;;
 		*) return 0 ;;
 	esac
 }
@@ -49,8 +57,12 @@ load_config() {
 	case "$AT_PORT" in
 		/dev/ttyUSB*[!0-9]*) log "invalid AT port"; return 1 ;;
 	esac
-	valid_name "$NETIF" && valid_name "$DATA_DEVICE" || {
+	if ! valid_name "$NETIF" || ! valid_name "$DATA_DEVICE"; then
 		log "set valid main.network and main.data_device values"
+		return 1
+	fi
+	[ "${#DATA_DEVICE}" -le 15 ] || {
+		log "main.data_device exceeds the Linux interface-name limit"
 		return 1
 	}
 	network_config_ready || {
@@ -90,11 +102,15 @@ find_usb_root() {
 	USB_ROOT=
 	USB_INSTANCE=
 	for _candidate in "$SYS_USB_ROOT"/*; do
-		[ -r "$_candidate/idVendor" ] && [ -r "$_candidate/idProduct" ] || continue
-		_candidate_vendor=$(cat "$_candidate/idVendor" 2>/dev/null | tr 'A-F' 'a-f')
-		_candidate_product=$(cat "$_candidate/idProduct" 2>/dev/null | tr 'A-F' 'a-f' | sed 's/^0*//')
+		if [ ! -r "$_candidate/idVendor" ] || [ ! -r "$_candidate/idProduct" ]; then
+			continue
+		fi
+		_candidate_vendor=$(tr 'A-F' 'a-f' <"$_candidate/idVendor")
+		_candidate_product=$(tr 'A-F' 'a-f' <"$_candidate/idProduct" | sed 's/^0*//')
 		[ -n "$_candidate_product" ] || _candidate_product=0
-		[ "$_candidate_vendor" = "$VENDOR" ] && [ "$_candidate_product" = "$PRODUCT_ID" ] || continue
+		if [ "$_candidate_vendor" != "$VENDOR" ] || [ "$_candidate_product" != "$PRODUCT_ID" ]; then
+			continue
+		fi
 		[ -z "$USB_ROOT" ] || {
 			USB_ROOT=
 			USB_INSTANCE=
@@ -135,10 +151,19 @@ network_config_ready() {
 	[ "$_configured_device" = "$DATA_DEVICE" ]
 }
 
-interface_has_lease() {
-	_status=$(ubus call "$NETIF_OBJECT" status 2>/dev/null) || return 1
+interface_status() {
+	ubus call "$NETIF_OBJECT" status 2>/dev/null
+}
+
+interface_is_up() {
+	_status=$(interface_status) || return 1
 	printf '%s\n' "$_status" | grep -Eq '"up"[[:space:]]*:[[:space:]]*true' || return 1
-	printf '%s\n' "$_status" | grep -Eq '"ipv4-address"[[:space:]]*:[[:space:]]*\[[^]]' 
+}
+
+interface_has_lease() {
+	_status=$(interface_status) || return 1
+	printf '%s\n' "$_status" | grep -Eq '"up"[[:space:]]*:[[:space:]]*true' || return 1
+	printf '%s\n' "$_status" | grep -Eq '"ipv4-address"[[:space:]]*:[[:space:]]*\[[^]]'
 }
 
 netif_up() {
@@ -150,22 +175,29 @@ netif_down() {
 }
 
 at_registration() {
-	AT_RESPONSE=
 	[ -c "$DEV_ROOT/${AT_PORT#/dev/}" ] || return 1
-	exec 3<> "$DEV_ROOT/${AT_PORT#/dev/}" || return 1
+	exec 3<> "$DEV_ROOT/${AT_PORT#/dev/}" || {
+		rm -f "$CHAT_FILE"
+		return 1
+	}
 	printf 'AT+CREG?\r' >&3 || {
 		exec 3>&- 3<&-
 		return 1
 	}
 	AT_CREG=
 	AT_GOT_OK=0
-	AT_DEADLINE=$AT_TIMEOUT
 	AT_LINES=0
 	while [ "$AT_LINES" -lt 8 ]; do
 		AT_LINE=
+		# BusyBox ash supports read -t; this worker targets OpenWrt ash, not strict POSIX sh.
+		# shellcheck disable=SC3045
 		read -r -t "$AT_TIMEOUT" AT_LINE <&3 || break
 		AT_LINES=$((AT_LINES + 1))
-		AT_LINE=${AT_LINE%$(printf '\r')}
+		AT_LINE=${AT_LINE%"$(printf '\r')"}
+		if ! find_usb_root || [ "$USB_INSTANCE" != "$DEVICE_KEY" ]; then
+			exec 3>&- 3<&-
+			return 1
+		fi
 		case "$AT_LINE" in
 			+CREG:*) AT_CREG=$AT_LINE ;;
 			OK) AT_GOT_OK=1; break ;;
@@ -183,18 +215,76 @@ at_registration() {
 	esac
 }
 
+at_context_active() {
+	[ -c "$DEV_ROOT/${AT_PORT#/dev/}" ] || return 1
+	exec 3<> "$DEV_ROOT/${AT_PORT#/dev/}" || return 1
+	printf 'AT+CGACT?\r' >&3 || {
+		exec 3>&- 3<&-
+		return 1
+	}
+	AT_CONTEXT=
+	AT_GOT_OK=0
+	AT_LINES=0
+	while [ "$AT_LINES" -lt 8 ]; do
+		AT_LINE=
+		# BusyBox ash supports read -t; this worker targets OpenWrt ash, not strict POSIX sh.
+		# shellcheck disable=SC3045
+		read -r -t "$AT_TIMEOUT" AT_LINE <&3 || break
+		AT_LINES=$((AT_LINES + 1))
+		AT_LINE=${AT_LINE%"$(printf '\r')"}
+		if ! find_usb_root || [ "$USB_INSTANCE" != "$DEVICE_KEY" ]; then
+			exec 3>&- 3<&-
+			return 1
+		fi
+		case "$AT_LINE" in
+			+CGACT:*) _context=$(printf '%s\n' "$AT_LINE" | sed -n 's/^+CGACT:[[:space:]]*1,[[:space:]]*\([01]\)[[:space:]]*$/\1/p')
+				[ -n "$_context" ] && AT_CONTEXT=$_context ;;
+			OK) AT_GOT_OK=1; break ;;
+			ERROR|"+CME ERROR:"*|"+CMS ERROR:"*) break ;;
+		esac
+	done
+	exec 3>&- 3<&-
+	[ "$AT_GOT_OK" = 1 ] || return 1
+	[ "$AT_CONTEXT" = 1 ] && return 0
+	return 2
+}
+
 activate_pdp() {
 	CHAT_FILE="$RUN_DIR/connect.chat"
+	if at_context_active; then
+		return 0
+	else
+		_CONTEXT_RESULT=$?
+		[ "$_CONTEXT_RESULT" -eq 2 ] || return 1
+	fi
 	{
 		printf '%s\n' 'ABORT BUSY' 'ABORT "NO CARRIER"' 'ABORT ERROR' 'TIMEOUT 5'
-		printf '%s\n' "'' AT" "OK 'AT+CGDCONT=1,\"IPV4V6\",\"$APN\"'" 'TIMEOUT 30'
-		printf '%s\n' 'OK "AT+CGATT=1"' 'OK "AT+CGACT=1,1"' "OK ''"
+		printf '%s\n' "'' AT"
+		[ -n "$APN" ] && printf '%s\n' "OK 'AT+CGDCONT=1,\"IPV4V6\",\"$APN\"'"
+		printf '%s\n' 'TIMEOUT 30' 'OK "AT+CGATT=1"'
+		printf '%s\n' 'OK "AT+CGACT=1,1"'
+		printf '%s\n' "OK ''"
 	} >"$CHAT_FILE" || return 1
-	chat -f "$CHAT_FILE" <"$DEV_ROOT/${AT_PORT#/dev/}" >"$DEV_ROOT/${AT_PORT#/dev/}" &
+	exec 3<> "$DEV_ROOT/${AT_PORT#/dev/}" || return 1
+	chat -f "$CHAT_FILE" <&3 >&3 &
 	CHAT_PID=$!
+	while kill -0 "$CHAT_PID" 2>/dev/null; do
+		if [ "$STOPPING" = 1 ] || ! find_usb_root || [ "$USB_INSTANCE" != "$DEVICE_KEY" ]; then
+			kill "$CHAT_PID" 2>/dev/null || :
+			wait "$CHAT_PID" 2>/dev/null || :
+			CHAT_PID=
+			exec 3>&- 3<&-
+			rm -f "$CHAT_FILE"
+			return 1
+		fi
+		sleep 1 &
+		_SLEEP_PID=$!
+		wait "$_SLEEP_PID" || :
+	done
 	wait "$CHAT_PID"
 	_CHAT_RESULT=$?
 	CHAT_PID=
+	exec 3>&- 3<&-
 	rm -f "$CHAT_FILE"
 	return "$_CHAT_RESULT"
 }
@@ -251,7 +341,6 @@ process_once() {
 		log "matching MF832S found; waiting for configured ports"
 	fi
 	if ! serial_ready || ! network_device_ready; then
-		READY=0
 		return 0
 	fi
 	if [ "$NETWORK_REQUESTED" = 0 ]; then
@@ -285,6 +374,17 @@ process_once() {
 		fi
 		[ "$NOW" -ge "$DHCP_DEADLINE" ] || return 0
 		[ "$NOW" -ge "$RETRY_AT" ] || return 0
+		if ! interface_is_up; then
+			if netif_up; then
+				PDP_ATTEMPTED=0
+				DHCP_DEADLINE=$((NOW + DHCP_WAIT))
+				log "netifd interface was down; requested it again"
+			else
+				record_failure
+				DHCP_DEADLINE=$RETRY_AT
+			fi
+			return 0
+		fi
 		if [ "$PDP_ATTEMPTED" = 1 ]; then
 			record_failure
 			PDP_ATTEMPTED=0
@@ -298,7 +398,7 @@ process_once() {
 		PDP_ATTEMPTED=1
 		RETRY_AT=0
 		DHCP_DEADLINE=$((NOW + DHCP_WAIT))
-		log "PDP activation requested; allowing netifd to obtain a lease"
+		log "PDP state checked; allowing netifd to obtain a lease"
 	elif [ "$_AT_STATE" -eq 2 ]; then
 		[ "$NOW" -lt "$DHCP_DEADLINE" ] || {
 			DHCP_DEADLINE=$((NOW + DHCP_WAIT))
@@ -319,6 +419,7 @@ cleanup() {
 		wait "$CHAT_PID" 2>/dev/null || :
 		CHAT_PID=
 	fi
+	exec 3>&- 3<&- 2>/dev/null || :
 	if [ "$NETWORK_REQUESTED" = 1 ]; then
 		netif_down
 		NETWORK_REQUESTED=0
@@ -327,17 +428,39 @@ cleanup() {
 }
 
 worker_main() {
-	load_config || return 0
+	if [ "$(uci_value enabled)" != 1 ]; then
+		return 0
+	fi
+	if ! load_config; then
+		STOPPING=0
+		trap 'STOPPING=1' INT TERM
+		while [ "$STOPPING" = 0 ]; do
+			sleep 3600 &
+			_SLEEP_PID=$!
+			wait "$_SLEEP_PID" || :
+		done
+		return 0
+	fi
 	mkdir -p "$RUN_DIR" || return 1
 	LOCK_DIR="$RUN_DIR/worker.lock"
 	if ! mkdir "$LOCK_DIR" 2>/dev/null; then
 		_LOCK_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null)
 		case "$_LOCK_PID" in
-			''|*[!0-9]*) ;;
-			*) kill -0 "$_LOCK_PID" 2>/dev/null && return 0 ;;
+			''|*[!0-9]*)
+				log "worker lock has no valid owner; refusing to start a second instance"
+				return 0
+				;;
+			*)
+				if kill -0 "$_LOCK_PID" 2>/dev/null; then
+					return 0
+				fi
+				;;
 		esac
-		rm -rf "$LOCK_DIR"
-		mkdir "$LOCK_DIR" 2>/dev/null || return 0
+		if rm "$LOCK_DIR/pid" 2>/dev/null && rmdir "$LOCK_DIR" 2>/dev/null; then
+			mkdir "$LOCK_DIR" 2>/dev/null || return 0
+		else
+			return 0
+		fi
 	fi
 	printf '%s\n' "$$" >"$LOCK_DIR/pid"
 	DEVICE_KEY=
@@ -348,14 +471,23 @@ worker_main() {
 	NEXT_HEALTH=0
 	CHAT_PID=
 	STOPPING=0
+	umask 077
 	trap cleanup EXIT
 	trap 'STOPPING=1' INT TERM
 	log "monitor started"
 	while [ "$STOPPING" = 0 ]; do
-		process_once || :
-		sleep "$POLL_INTERVAL" &
-		_SLEEP_PID=$!
-		wait "$_SLEEP_PID" || :
+		process_once "$(date +%s)" || :
+		_SLEEP=0
+		while [ "$_SLEEP" -lt "$POLL_INTERVAL" ] && [ "$STOPPING" = 0 ]; do
+			if [ -e "$RUN_DIR/event" ]; then
+				rm -f "$RUN_DIR/event"
+				break
+			fi
+			sleep 1 &
+			_SLEEP_PID=$!
+			wait "$_SLEEP_PID" || :
+			_SLEEP=$((_SLEEP + 1))
+		done
 	done
 }
 
