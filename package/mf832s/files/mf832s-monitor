@@ -432,7 +432,12 @@ reconcile() {
 		return
 	fi
 	if [ "$pending" = true ]; then
-		[ -n "$owned_device" ] && [ "$lease_deadline" -gt 0 ] &&
+		[ "$owned_device" = "$net" ] && [ "$owned_usb" = "$usb" ] &&
+		[ "$owned_generation" = "$generation" ] && same_generation || return
+		# netifd may restart DHCP after carrier loss without a monitor up request.
+		if [ "$lease_deadline" = 0 ]; then
+			lease_deadline=$((current + dhcp_timeout))
+		fi
 		[ "$current" -ge "$lease_deadline" ] || return
 		network_down
 		retry
