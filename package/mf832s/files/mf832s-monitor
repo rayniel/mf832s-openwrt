@@ -1,0 +1,504 @@
+#!/bin/sh
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+. /lib/functions.sh
+umask 077
+RUN=/var/run/mf832s
+LOCK=/var/run/mf832s.lock
+child=
+owned_device=
+owned_usb=
+owned_generation=
+generation=
+next_try=0
+lease_deadline=0
+interrupted=0
+transaction_active=0
+health_next=0
+health_bad=0
+
+log() { logger -t mf832s "$*"; }
+now() { date +%s; }
+cancel() {
+	interrupted=1
+	[ -z "$child" ] || kill "$child" 2>/dev/null
+}
+
+wake() {
+	if [ "$transaction_active" = 1 ]; then
+		# Duplicate/unrelated events must not starve a valid modem transaction.
+		same_generation && return
+		cancel
+	elif [ -n "$child" ]; then
+		cancel
+	fi
+}
+
+valid_name() {
+	case "$1" in ''|*[!a-zA-Z0-9_.-]*) return 1;; esac
+	[ "${#1}" -le 64 ]
+}
+
+number() {
+	case "$2" in ''|*[!0-9]*) return 1;; esac
+	case "$2" in 0[0-9]*) return 1;; esac
+	[ "${#2}" -le 5 ] && [ "$2" -ge "$3" ] && [ "$2" -le "$4" ] ||
+		return 1
+}
+
+load_config() {
+	config_load mf832s
+	config_get_bool enabled main enabled 0
+	[ "$enabled" = 1 ] || return 1
+	config_get interface main interface mf832s
+	config_get apn main apn ''
+	config_get pdp_type main pdp_type IPV4V6
+	config_get cid main cid 1
+	config_get vid main vid 19d2
+	config_get pid main pid 0199
+	config_get usb_path main usb_path ''
+	config_get serial main serial ''
+	config_get at_interface main at_interface ''
+	config_get at_device main at_device ''
+	config_get net_device main net_device ''
+	config_get query_timeout main query_timeout 5
+	config_get transaction_timeout main transaction_timeout 45
+	config_get poll_interval main poll_interval 10
+	config_get retry_initial main retry_initial 5
+	config_get retry_max main retry_max 120
+	config_get dhcp_timeout main dhcp_timeout 60
+	config_get health_interval main health_interval 30
+	config_get health_failures main health_failures 3
+	valid_name "$interface" || return 1
+	# APNs cannot inject chat syntax or AT commands; the empty default is allowed.
+	case "$apn" in *[!a-zA-Z0-9._-]*) return 1;; esac
+	[ "${#apn}" -le 100 ] || return 1
+	case "$pdp_type" in IP|IPV6|IPV4V6) :;; *) return 1;; esac
+	number cid "$cid" 1 16 &&
+	number query_timeout "$query_timeout" 1 30 &&
+	number transaction_timeout "$transaction_timeout" 5 300 &&
+	number poll_interval "$poll_interval" 1 300 &&
+	number retry_initial "$retry_initial" 1 300 &&
+	number retry_max "$retry_max" "$retry_initial" 3600 &&
+	number dhcp_timeout "$dhcp_timeout" 5 600 &&
+	number health_interval "$health_interval" 5 600 &&
+	number health_failures "$health_failures" 1 10 || return 1
+	[ "$transaction_timeout" -ge "$query_timeout" ] || return 1
+	case "$vid$pid" in *[!0-9a-fA-F]*) return 1;; esac
+	[ "${#vid}" = 4 ] && [ "${#pid}" = 4 ] || return 1
+	vid=$(printf '%s' "$vid" | tr A-F a-f)
+	pid=$(printf '%s' "$pid" | tr A-F a-f)
+	case "$usb_path" in *[!0-9.-]*) return 1;; esac
+	if [ -n "$at_interface" ]; then
+		case "$at_interface" in *[!0-9a-fA-F]*) return 1;; esac
+		[ "${#at_interface}" = 2 ] || return 1
+		at_interface=$(printf '%s' "$at_interface" | tr A-F a-f)
+	fi
+	if [ -n "$at_device" ]; then
+		case "$at_device" in /dev/ttyUSB*) suffix=${at_device#/dev/ttyUSB};;
+			/dev/ttyACM*) suffix=${at_device#/dev/ttyACM};; *) return 1;; esac
+		case "$suffix" in ''|*[!0-9]*) return 1;; esac
+	fi
+	[ -n "$at_interface$at_device" ] || return 1
+	[ -z "$net_device" ] || valid_name "$net_device" || return 1
+	backoff=$retry_initial
+}
+
+usb_parent() {
+	local path
+	path=$(readlink -f "$1") || return 1
+	while [ -n "$path" ] && [ "$path" != / ]; do
+		if [ -f "$path/idVendor" ] && [ -f "$path/idProduct" ]; then
+			printf '%s\n' "$path"
+			return 0
+		fi
+		path=${path%/*}
+	done
+	return 1
+}
+
+stamp() {
+	[ -r "$1/busnum" ] && [ -r "$1/devnum" ] || return 1
+	printf '%s:%s:%s\n' "$1" "$(cat "$1/busnum")" "$(cat "$1/devnum")"
+}
+
+discover() {
+	local path count candidate parent tty_path walk ifnum
+	usb='' at='' net=''
+	count=0
+	for path in /sys/bus/usb/devices/*; do
+		[ -r "$path/idVendor" ] && [ -r "$path/idProduct" ] || continue
+		[ "$(cat "$path/idVendor")" = "$vid" ] &&
+		[ "$(cat "$path/idProduct")" = "$pid" ] || continue
+		[ -z "$usb_path" ] || [ "${path##*/}" = "$usb_path" ] || continue
+		[ -z "$serial" ] || [ "$(cat "$path/serial" 2>/dev/null)" = "$serial" ] || continue
+		count=$((count + 1))
+		usb=$(readlink -f "$path")
+	done
+	[ "$count" = 1 ] || return 1
+	found_generation=$(stamp "$usb") || return 1
+	count=0
+	for tty_path in /sys/class/tty/ttyUSB* /sys/class/tty/ttyACM*; do
+		[ -e "$tty_path/device" ] || continue
+		candidate=/dev/${tty_path##*/}
+		[ -z "$at_device" ] || [ "$candidate" = "$at_device" ] || continue
+		parent=$(usb_parent "$tty_path/device") || continue
+		[ "$parent" = "$usb" ] || continue
+		if [ -n "$at_interface" ]; then
+			walk=$(readlink -f "$tty_path/device")
+			ifnum=
+			while [ "$walk" != "$usb" ] && [ -n "$walk" ]; do
+				if [ -r "$walk/bInterfaceNumber" ]; then
+					ifnum=$(cat "$walk/bInterfaceNumber")
+					break
+				fi
+				walk=${walk%/*}
+			done
+			[ "$ifnum" = "$at_interface" ] || continue
+		fi
+		[ -c "$candidate" ] || continue
+		count=$((count + 1))
+		at=$candidate
+	done
+	[ "$count" = 1 ] || return 1
+	count=0
+	for path in /sys/class/net/*; do
+		candidate=${path##*/}
+		[ -z "$net_device" ] || [ "$candidate" = "$net_device" ] || continue
+		parent=$(usb_parent "$path/device") || continue
+		[ "$parent" = "$usb" ] || continue
+		count=$((count + 1))
+		net=$candidate
+	done
+	[ "$count" = 1 ]
+}
+
+network_config() {
+	local proto device section_type
+	config_load network
+	config_get section_type "$interface" TYPE
+	config_get proto "$interface" proto
+	config_get device "$interface" device
+	[ "$section_type" = interface ] && [ "$proto" = dhcp ] && [ "$device" = "$1" ]
+}
+
+network_status() {
+	status=$(ubus -t 2 call "network.interface.$interface" status 2>/dev/null) || return 1
+	up=$(jsonfilter -s "$status" -e '@.up')
+	pending=$(jsonfilter -s "$status" -e '@.pending')
+	available=$(jsonfilter -s "$status" -e '@.available')
+	l3=$(jsonfilter -s "$status" -e '@.l3_device')
+	status_device=$(jsonfilter -s "$status" -e '@.device')
+	[ "$up" = true ] || [ "$up" = false ] || return 1
+	[ "$pending" = true ] || [ "$pending" = false ] || return 1
+	[ "$available" = true ] || [ "$available" = false ] || return 1
+	[ -z "$l3" ] || [ "$l3" = "$1" ] || return 1
+	[ -z "$status_device" ] || [ "$status_device" = "$1" ] || return 1
+}
+
+network_down() {
+	local parent
+	[ -n "$owned_device" ] || return 0
+	# Never bring down an interface whose configuration or physical owner changed.
+	if network_config "$owned_device" && network_status "$owned_device"; then
+		parent=$(usb_parent "/sys/class/net/$owned_device/device")
+		if [ -z "$parent" ] || {
+			[ "$parent" = "$owned_usb" ] &&
+			[ "$(stamp "$parent" 2>/dev/null)" = "$owned_generation" ]
+		}; then
+			ubus -t 2 call "network.interface.$interface" down >/dev/null 2>&1 || return 1
+		fi
+	fi
+	owned_device='' owned_usb='' owned_generation='' lease_deadline=0
+}
+
+cleanup() {
+	trap '' USR1
+	cancel
+	[ -z "$child" ] || kill -KILL "$child" 2>/dev/null
+	[ -z "$child" ] || wait "$child" 2>/dev/null
+	network_down
+	# The persistent lock is outside this private directory and is never unlinked.
+	rm -rf "$RUN"
+}
+
+same_generation() {
+	[ "$(stamp "$usb" 2>/dev/null)" = "$generation" ] &&
+	[ "$(usb_parent "/sys/class/tty/${at##*/}/device")" = "$usb" ] &&
+	[ "$(usb_parent "/sys/class/net/$net/device")" = "$usb" ]
+}
+
+await_child() {
+	local end rc
+	end=$1
+	while kill -0 "$child" 2>/dev/null; do
+		if [ "$interrupted" = 1 ] || [ "$(now)" -ge "$end" ] || ! same_generation; then
+			kill -KILL "$child" 2>/dev/null
+			wait "$child" 2>/dev/null
+			child=
+			return 1
+		fi
+		sleep 1
+	done
+	wait "$child"
+	rc=$?
+	child=
+	[ "$rc" = 0 ] && [ "$interrupted" = 0 ] && same_generation
+}
+
+query() {
+	local command timeout end
+	command=$1
+	end=$(( $(now) + query_timeout ))
+	[ "$end" -le "$transaction_end" ] || end=$transaction_end
+	timeout=$((end - $(now)))
+	[ "$timeout" -gt 0 ] && [ "$interrupted" = 0 ] && same_generation || return 1
+	{
+		printf 'ABORT "\\r\\nERROR\\r\\n"\nABORT "+CME ERROR:"\nABORT "\\r\\nNO CARRIER\\r\\n"\nABORT "\\r\\nBUSY\\r\\n"\nTIMEOUT %s\n' "$timeout"
+		printf "'' '%s'\n'\\\\r\\\\nOK\\\\r\\\\n' ''\n" "$command"
+	} >"$RUN/query.chat"
+	# Transcript is private and never passed to logger (it may contain an APN).
+	(
+		exec 9>&-
+		exec chat -S -s -V -f "$RUN/query.chat" <"$at" >"$at" 2>"$RUN/response"
+	) &
+	child=$!
+	await_child "$end"
+}
+
+registered() {
+	local kind
+	for kind in CEREG CGREG CREG; do
+		if query "AT+$kind?"; then
+			# Query replies are <n>,<stat>; one-field replies are <stat>.
+			awk -v prefix="+$kind:" '
+				index($0, prefix) {
+					line=substr($0,index($0,prefix)+length(prefix))
+					gsub(/\r/,"",line); gsub(/ /,"",line)
+					n=split(line,a,","); s=(n>1 ? a[2] : a[1])
+					if (s=="1" || s=="5") found=1
+				}
+				END { exit !found }
+			' "$RUN/response" && return 0
+		fi
+		[ "$interrupted" = 0 ] || return 1
+	done
+	return 1
+}
+
+active() {
+	query "AT+$1?" || return 2
+	awk -v prefix="+$1:" -v cid="$cid" '
+		index($0,prefix) {
+			line=substr($0,index($0,prefix)+length(prefix))
+			gsub(/\r/,"",line); gsub(/ /,"",line)
+			n=split(line,a,",")
+			if (n!=2 || a[1]!~/^[0-9]+$/ || (a[2]!="0" && a[2]!="1"))
+				malformed=1
+			if (n==2 && a[1]==cid && (a[2]=="0" || a[2]=="1")) {
+				known=1; if (a[2]=="1") found=1
+			}
+		}
+		END { exit (found ? 0 : (known ? 1 : (malformed ? 2 : 3))) }
+	' "$RUN/response"
+}
+
+undefined_context() {
+	query 'AT+CGDCONT?' || return 1
+	awk -v cid="$cid" '
+		index($0,"+CGDCONT:") {
+			line=substr($0,index($0,"+CGDCONT:")+9)
+			gsub(/\r/,"",line); gsub(/ /,"",line)
+			n=split(line,a,",")
+			if (a[1]==cid) defined=1
+			if (n<3 || a[1]!~/^[0-9]+$/ ||
+			    a[2]!~/^"[A-Za-z0-9]+"$/ || a[3]!~/^"[^"]*"$/)
+				malformed=1
+		}
+		END { exit (defined || malformed) }
+	' "$RUN/response"
+}
+
+begin_transaction() {
+	transaction_end=$(( $(now) + transaction_timeout ))
+	(
+		exec 9>&-
+		exec stty -F "$at" 115200 raw -echo clocal 2>/dev/null
+	) &
+	child=$!
+	await_child "$transaction_end" || return 1
+	query AT
+}
+
+function_ready() {
+	local state
+	query 'AT+CFUN?' || return 1
+	state=$(awk '
+		/\+CFUN:/ {
+			line=substr($0,index($0,"+CFUN:")+6)
+			gsub(/\r/,"",line); gsub(/ /,"",line)
+			if (line=="0" || line=="1") print line
+		}
+	' "$RUN/response")
+	case "$state" in 1) return 0;; 0) query 'AT+CFUN=1';; *) return 1;; esac
+}
+
+health() {
+	local cg zg
+	begin_transaction && registered || return 1
+	active CGACT; cg=$?
+	active ZGACT; zg=$?
+	[ "$interrupted" = 0 ] && same_generation || return 1
+	[ "$cg" != 1 ] && [ "$zg" != 1 ] &&
+		{ [ "$cg" = 0 ] || [ "$zg" = 0 ]; }
+}
+
+activate() {
+	local cg zg
+	begin_transaction && function_ready && registered || return 1
+	active CGACT; cg=$?
+	active ZGACT; zg=$?
+	[ "$interrupted" = 0 ] && same_generation || return 1
+	# A successfully omitted CID may be new, but only definitions can confirm that.
+	if [ "$cg" = 3 ] && [ "$zg" != 0 ]; then
+		undefined_context || return 1
+		cg=1
+	fi
+	# Unknown CGACT state is not safe to overwrite; retry without changing the APN.
+	[ "$cg" != 2 ] || [ "$zg" = 0 ] || return 1
+	if [ "$cg" != 0 ] && [ "$zg" != 0 ]; then
+		query "AT+CGDCONT=$cid,\"$pdp_type\",\"$apn\"" &&
+		query "AT+CGATT=1" &&
+		query "AT+CGACT=1,$cid" || return 1
+	fi
+	if [ "$zg" != 0 ]; then
+		query "AT+ZGACT=1,$cid" || return 1
+	fi
+	# Success here means modem activation, not a DHCP lease.
+	return 0
+}
+
+retry() {
+	next_try=$(( $(now) + backoff ))
+	backoff=$((backoff * 2))
+	[ "$backoff" -le "$retry_max" ] || backoff=$retry_max
+}
+
+reconcile() {
+	local previous current activation_rc
+	previous=$generation
+	if ! discover; then
+		network_down
+		generation=
+		return
+	fi
+	generation=$found_generation
+	if [ "$generation" != "$previous" ]; then
+		network_down || { retry; return; }
+		next_try=0
+		backoff=$retry_initial
+		health_next=0
+		health_bad=0
+	fi
+	network_config "$net" && network_status "$net" || {
+		network_down
+		return
+	}
+	current=$(now)
+	[ "$current" -ge "$next_try" ] || return
+	# A DHCP lease is not proof that the modem's PDP context is still active.
+	if [ "$up" = true ]; then
+		lease_deadline=0
+		[ "$current" -ge "$health_next" ] || return
+		transaction_active=1
+		health
+		activation_rc=$?
+		transaction_active=0
+		health_next=$(( $(now) + health_interval ))
+		if [ "$activation_rc" = 0 ]; then
+			health_bad=0
+			backoff=$retry_initial
+		else
+			health_bad=$((health_bad + 1))
+			if [ "$health_bad" -ge "$health_failures" ]; then
+				# An interface that we did not start must never be cycled.
+				network_down
+				retry
+				health_bad=0
+				log 'Repeated modem health failures; backing off'
+			fi
+		fi
+		return
+	fi
+	if [ "$pending" = true ]; then
+		[ "$owned_device" = "$net" ] && [ "$owned_usb" = "$usb" ] &&
+		[ "$owned_generation" = "$generation" ] && same_generation || return
+		# netifd may restart DHCP after carrier loss without a monitor up request.
+		if [ "$lease_deadline" = 0 ]; then
+			lease_deadline=$((current + dhcp_timeout))
+		fi
+		[ "$current" -ge "$lease_deadline" ] || return
+		network_down
+		retry
+		log 'DHCP attempt timed out; backing off'
+		return
+	fi
+	[ "$available" = true ] || return
+	if [ -n "$owned_device" ] && [ "$lease_deadline" -gt "$current" ]; then
+		return
+	fi
+	if [ -n "$owned_device" ]; then
+		network_down
+		retry
+		log 'DHCP lease failed; backing off'
+		return
+	fi
+	transaction_active=1
+	activate
+	activation_rc=$?
+	transaction_active=0
+	if [ "$activation_rc" != 0 ]; then
+		retry
+		[ "$interrupted" = 1 ] || log 'Registration or activation incomplete; backing off'
+		return
+	fi
+	same_generation && network_config "$net" && network_status "$net" || { retry; return; }
+	[ "$available" = true ] && [ "$pending" != true ] && [ "$up" != true ] || return
+	if ubus -t 2 call "network.interface.$interface" up >/dev/null 2>&1; then
+		owned_device=$net
+		owned_usb=$usb
+		owned_generation=$generation
+		lease_deadline=$(( $(now) + dhcp_timeout ))
+		health_next=$(( $(now) + health_interval ))
+		health_bad=0
+		log 'PDP activated; waiting for netifd DHCP'
+	else
+		retry
+	fi
+}
+
+load_config || { log 'Disabled or invalid configuration (explicit AT selection required)'; exit 1; }
+for tool in chat stty ubus jsonfilter flock; do
+	command -v "$tool" >/dev/null 2>&1 || { log "Required tool missing: $tool"; exit 1; }
+done
+# The kernel releases this persistent inode's lock even on a monitor crash.
+exec 9>"$LOCK" || exit 1
+flock -n 9 || exit 0
+rm -rf "$RUN"
+mkdir "$RUN" || exit 1
+printf '%s\n' "$$" >"$RUN/pid"
+trap 'cleanup; exit 0' TERM INT
+trap wake USR1
+while :; do
+	interrupted=0
+	reconcile
+	# Events cancel work but do not reset backoff; polling catches missed events.
+	(
+		exec 9>&-
+		exec sleep "$poll_interval"
+	) &
+	child=$!
+	wait "$child" 2>/dev/null
+	child=
+done
