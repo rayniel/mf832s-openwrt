@@ -1,53 +1,177 @@
-环境要求 openwrt 18.06.4   //其他版本有些软件名字不一致,需要手工修改,但仍可使用.
-Requirement system version openwrt 18.06.4   //other version have some package name or grammar issues,but still work if you can fix it by yourself.
+MF832S OpenWrt package
+=====================
 
-系统软件包要求
-Package Requirement
+本包实现 ZTE AT 控制面 + USB Ethernet 数据面。procd 管理前台监控进程，
+hotplug 仅发送有界通知，netifd DHCP 管理地址、路由、DNS 和租约续期。
+不要再复制旧 etc/ 脚本，不要使用 unmanaged 接口或手工运行 udhcpc。
+
+目标接口基线：OpenWrt 24.10（procd、netifd、UCI、opkg）。
+这不是实机兼容性认证：尚未在 SDK 或 MF832S 硬件上验证。
+原 18.06.4 使用说明不能作为新包兼容性依据。其他分支须重新检查
+包名、netifd 配置、BusyBox applet 及包管理器。
+单设备 MVP 不实现 PPP、QMI、通用 NCM 控制协议、SIM PIN 解锁或 IPv6 配置。
+IPV4V6 PDP 不等于 OpenWrt 已配置 IPv6。
+
+1. 先确认硬件，不要安装所有驱动
+-----------------------------
+默认 VID/PID 19d2:0199 来自旧脚本，不限定 bcdDevice 固件版本。
+实机冷插入后检查：
+
+  logread
+  ls /sys/bus/usb/devices/
+  readlink -f /sys/class/tty/ttyUSB*/device
+  readlink -f /sys/class/net/*/device
+
+检查对应 USB 父目录中的 idVendor、idProduct、serial、busnum、devnum，
+USB 接口目录中的 bInterfaceNumber 和 driver 链接。记录哪个串口是 AT 口，
+哪个网卡属于同一个 USB 设备；不能仅凭 ttyUSB0 或 eth1 的名称判断。
+usbutils/lsusb 仅用于可选诊断。
+
+按实际绑定驱动选择：
+  option       -> kmod-usb-serial-option
+  rndis_host   -> kmod-usb-net-rndis
+  cdc_ether    -> kmod-usb-net-cdc-ether
+  cdc_ncm      -> kmod-usb-net-cdc-ncm
+
+安装串口驱动和一个已确认的数据面驱动。基础 usb-serial、usb-serial-wwan、
+usb-net 通常由这些驱动的依赖闭包引入，不重复强制声明。
+没有 Huawei 专用驱动证据，不安装 kmod-usb-net-huawei-cdc-ncm。
+只有冷插入先进入存储模式、且目标软件源有适用切换规则时才安装 usb-modeswitch；
+本包不提供未经验证的 USB 模式切换规则，也不写入内核 new_id。
+
+包 Makefile 仅声明实际用户空间依赖：
+busybox、chat、coreutils-stty、flock、netifd、uci、ubus、procd、jsonfilter。
+chat 是独立包，不要求安装 ppp、comgt-ncm、LuCI PPP/NCM/QMI。
+24.10 的 BusyBox 默认未启用 stty，因此明确依赖 coreutils-stty；
+flock 提供崩溃后自动释放的单实例锁，不使用容易遗留的 mkdir 锁。
+硬件未知时不猜测 kmod 依赖；因此本包不是自动安装所有驱动的硬件元包。
+自定义固件须包含所需 BusyBox 工具及 netifd 所用的 udhcpc applet。
+内核模块必须匹配设备固件的目标、版本及内核 ABI，不能从其他版本混装。
+
+2. 使用官方 SDK/buildroot 构建
 ----------------------------
-comgt-ncm 
-kmod-usb-net-huawei-cdc-ncm 
-usb-modeswitch 
-kmod-usb-serial 
-kmod-usb-serial-option 
-kmod-usb-serial-wwan 
-kmod-usb-net 
-kmod-usb-net-rndis 
-usbutils 
-luci-proto-ppp 
-luci-proto-ncm 
-luci-proto-qmi
+源码结构：
+  package/mf832s/Makefile
+  package/mf832s/files/mf832s.config
+  package/mf832s/files/mf832s.init
+  package/mf832s/files/mf832s-monitor
+  package/mf832s/files/20-mf832s
+  package/mf832s/files/20-mf832s-net
+  LICENSE
 
-//所有包都需安装到位,看了很多论坛帖子和官网介绍总结的.虽然有些包名字看起来不需要,但是主要是安装这个包的时候系统会安装许多他的前置包,可能和那个前置包有关.
-//Install all packages and don't missing anything.
+保留仓库布局：Makefile 的 Build/Prepare 从 ../../LICENSE 复制许可证。
+例如将完整仓库放到 SDK 的 package/mf832s-openwrt/；不要只复制内层包目录。
+安装并配置目标平台官方 SDK，更新其 feeds，在 menuconfig 的 Network / WWAN
+选择 mf832s，随后使用 SDK 标准包目标构建：
 
+  make package/mf832s-openwrt/package/mf832s/compile V=s
 
+若采用不同源码挂载目录，调整目标路径。从 SDK bin/packages/ 查找生成的包。
+本包是 PKGARCH=all 的脚本包，没有编译器或额外构建依赖；
+这不代表 kmod 跨架构通用。不要在本仓库根目录直接运行 make 期待生成固件。
+24.10 用 opkg 安装生成的 ipk；其他分支按其原生包管理器处理。
+需先提供/安装对应软件源中的运行时依赖和实机确认的 USB 驱动。
 
+参考：
+https://openwrt.org/docs/guide-developer/packages
+https://openwrt.org/docs/guide-developer/toolchain/using_the_sdk
+https://github.com/openwrt/openwrt/blob/openwrt-24.10/package/network/services/ppp/Makefile
+https://github.com/openwrt/openwrt/blob/openwrt-24.10/package/kernel/linux/modules/usb.mk
+https://github.com/openwrt/openwrt/blob/openwrt-24.10/package/kernel/linux/modules/usb-net.mk
+https://github.com/openwrt/openwrt/blob/openwrt-24.10/package/utils/busybox/Config-defaults.in
+https://github.com/openwrt/packages/blob/openwrt-24.10/utils/coreutils/Makefile
+https://github.com/openwrt/openwrt/blob/openwrt-24.10/package/utils/util-linux/Makefile
 
+3. 配置网络与服务
+----------------
+安装默认不拨号，不创建网络接口，不修改防火墙或用户 WAN。
+/etc/config/mf832s 是升级保留的配置文件；程序资源不作为 conffile。
+没有 uci-defaults：本包不应通过一次性脚本替用户猜测网卡或改动 WAN。
 
-1.添加一个名字叫"mf832s"的interface.
-  Add a interface call "mf832s".
-2.在通用设置页面设置协议为"未设置"
-  Set the protocol to "unmanaged" at General Setup page.
-3.在高级设置中将自动启动与强制连接勾选.
-  Click "bring up on boot" and "force link" at Advanced Settings page.
-4.在物理设置页面将端口选为eth1
-  Select interface "eth1" at Physical Settings page.
-5.在防火墙页面选择"wan"区域
-  Select "WAN Zone" at Firewall Settings page.
-6.使用SSH登陆到openwrt路由器.输入命令 "udhcpc -i eth1" 回车.
-  Login to openwrt router by SSH clent.Input and run command "udhcpc -i eth1" .
-7.当你看到如下内容即为4G上网成功.
-  When you saw screen output line like this,you are already on 4G network.
+先停用或删除以前手工安装的 /etc/hotplug.d/usb/20-mf832s.sh，
+并停止旧手工 udhcpc。旧 /etc/chatscripts/mf832s*.chat 不再使用。
+在 LuCI 或 UCI 创建独立的 DHCP 逻辑接口，按已验证的 USB 网卡绑定：
 
-范例  
-SCREEN SAMPLE
+  config interface 'mf832s'
+      option proto 'dhcp'
+      option device '实际USB网卡名'
+      option auto '0'
 
-root@OpenWrt:/etc# udhcpc -i eth1
-udhcpc: started, v1.28.4
-udhcpc: sending discover
-udhcpc: sending select for 10.40.162.36
-udhcpc: lease of 10.40.162.36 obtained, lease time 7200
-udhcpc: ifconfig eth1 10.40.162.36 netmask 255.0.0.0 broadcast +
-udhcpc: setting default routers: 10.40.162.37
+auto=0 使本服务在 AT 激活成功后启动接口，避免开机竞态。
+不得使用 bridge、unmanaged、其他协议或绑定不属于该 USB 父设备的网卡。
+服务校验已有接口，不写 network UCI、不执行全局 network reload。
+需要 LAN 共享上网时，用户显式将这个逻辑接口加入合适的 WAN 防火墙区，
+检查转发、masquerading、路由 metric 和 DNS；本包不会覆盖这些策略。
 
-  
+编辑 /etc/config/mf832s，设置运营商 APN、确认的 AT 口选择及设备标识；
+缺少明确 AT 口选择时拒绝猜测。配置格式和默认值见安装的配置文件。
+配置节是 config mf832s 'main'；仅支持一个监控实例：
+
+  enabled             0          确认配置后改为 1
+  interface           mf832s     已创建的 DHCP 逻辑接口
+  vid / pid           19d2/0199  四位十六进制 USB ID
+  usb_path / serial   空         多设备时按拓扑名/序列号进一步筛选
+  at_interface        空         已验证 AT 口的两位十六进制 bInterfaceNumber
+  at_device           空         或明确指定 /dev/ttyUSBn、/dev/ttyACMn
+  net_device          空         自动关联唯一网卡，或指定并校验同设备归属
+  apn                 空         默认依赖固件/运营商允许空 APN，建议明确设置
+  pdp_type / cid      IPV4V6/1   支持 IP、IPV6、IPV4V6；CID 1..16
+  query_timeout       5          单条 AT 查询超时，秒（1..30）
+  transaction_timeout 45         整轮 AT 操作上限，秒（5..300）
+  poll_interval       10         周期状态检查间隔，秒（1..300）
+  retry_initial       5          初始退避，秒（1..300）
+  retry_max           120        最大退避，秒（不小于初始值，最大 3600）
+  dhcp_timeout        60         租约等待窗口，秒（5..600）
+
+transaction_timeout 不得小于 query_timeout。多设备筛选结果、所选 AT 口或
+网卡存在歧义时拒绝连接。at_interface 和 at_device 同时设置时均须匹配。
+USB 拔插导致 ttyUSB 编号改变时优先使用已验证的 at_interface。
+APN 仅接受字母、数字、点、下划线、连字符；不允许 AT/chat 控制字符。
+不输出完整 AT 响应、SIM 身份或其他敏感数据。
+完成配置后将 enabled 设为 1，再运行：
+
+  /etc/init.d/mf832s enable
+  /etc/init.d/mf832s start
+
+修改配置后运行 /etc/init.d/mf832s reload。
+服务开机启用与配置 enabled 是两回事；enabled=0 时不创建监控实例。
+其他调制解调器管理器不得同时占用所选串口。
+
+4. 运行、恢复和排障
+------------------
+服务启动扫描已经插入的设备；USB/net 事件经 procd 唤醒检查，
+通知丢失时周期扫描仍可恢复。通知不会在 hotplug 中执行 AT、等待注册或 DHCP。
+AT 操作串行执行并有超时；注册通过主动查询判断本地/漫游状态，
+不依赖两次 +CREG 通知或要求所有注册查询都支持。
+PDP 已激活时不重复写 CGDCONT。只有激活路径使用 ZTE AT+ZGACT，
+需要在实际固件上验证，不能当作通用蜂窝协议。
+
+procd respawn 只恢复进程崩溃；网络失败使用有上限的退避间隔重试。
+设备消失/代次变化取消旧串口任务；DHCP 由 netifd 管理，没有第二个 udhcpc。
+AT 激活、DHCP pending、已获地址不是同一状态，公网探测不作为断网重置依据。
+停止/reload 取消本服务子任务；不会删除用户网络或防火墙配置。
+
+  logread -e mf832s
+  ubus call service list '{"name":"mf832s"}'
+  ubus call network.interface.mf832s status
+  /etc/init.d/mf832s stop
+
+若没有地址，依次检查 USB 驱动、AT 口归属、SIM/APN/注册、netifd DHCP 和防火墙。
+不要在调试时启动第二个 chat/串口管理器，也不要用手工 udhcpc 绕过 netifd。
+卸载前停止服务。标准包生命周期处理 init 注册；用户创建的 network/firewall
+配置保留，用户自行决定是否删除。升级保留 /etc/config/mf832s。
+
+5. 验收清单（需要 SDK 与实机，不代表已经通过）
+-----------------------------------------
+- 包构建、依赖闭包、文件权限、安装路径及配置保留正确。
+- 无设备安装成功；默认不拨号、不修改 WAN；升级和卸载无遗留进程。
+- 开机前/后插入，串口/网卡延迟出现，重命名，多 USB 设备和错误 AT 口。
+- 重复事件、快速拔插、AT/注册/DHCP 期间拔出、stop/reload 清理。
+- 超时、SIM 不就绪、APN 错误、本地/漫游注册及不支持的注册查询。
+- PDP 已激活但逻辑接口未启动；DHCP 无响应、续租和租约恢复。
+- 非 MF832S 事件不影响后续 hotplug 处理器；设备关联失败时拒绝操作。
+- 非 DHCP、网卡不匹配或用户网络配置改变时不操作其他接口。
+- 配置换行/引号/控制字符被拒绝；临时文件私有，不记录敏感 AT 内容。
+
+许可证：仓库提供 GPL version 3 正文，包元数据采用 GPL-3.0-only，
+不从许可证末尾应用示例推断 “or later” 授权。

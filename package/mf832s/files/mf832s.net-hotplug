@@ -1,0 +1,10 @@
+#!/bin/sh
+
+(
+	case "$ACTION" in
+		add|remove|register|unregister|move)
+			ubus -t 1 call service signal '{"name":"mf832s","signal":10}' >/dev/null 2>&1
+			;;
+	esac
+	:
+)
