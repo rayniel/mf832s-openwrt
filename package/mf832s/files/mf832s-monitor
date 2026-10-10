@@ -26,6 +26,7 @@ transaction_mode=
 diagnostic=
 event_reader=
 event_listener=
+event_guard=
 event_epoch=0
 fence=0
 
@@ -238,6 +239,13 @@ network_down() {
 	owned_device='' owned_usb='' owned_generation='' lease_deadline=0 owned_online=0 owned_event=''
 }
 
+coordinate_pending() {
+	# Do not claim ownership before teardown: the target may have become online.
+	same_generation && network_config "$net" && network_status "$net" &&
+		[ "$up" = false ] && [ "$pending" = true ] || return 1
+	ubus -t 2 call "network.interface.$interface" down >/dev/null 2>&1
+}
+
 cleanup() {
 	trap '' USR1
 	cancel
@@ -267,22 +275,25 @@ read_events() {
 		action=$(jsonfilter -s "$line" -e '@["network.interface"].action' 2>/dev/null)
 		if [ "$target" = "$interface" ] && [ "$action" = ifdown ]; then
 			sequence=$((sequence + 1))
-			printf '%s\n' "$sequence" >"$RUN/iface-sequence.new"
-			mv "$RUN/iface-sequence.new" "$RUN/iface-sequence"
+			printf '%s\n' "$sequence" >"$RUN/iface-sequence.new" || return 1
+			mv "$RUN/iface-sequence.new" "$RUN/iface-sequence" || return 1
 			kill -USR1 "$monitor_pid" 2>/dev/null
 		fi
 		token=$(jsonfilter -s "$line" -e '@["mf832s.fence"].token' 2>/dev/null)
 		case "$token" in ''|*[!0-9]*) continue;; esac
-		printf '%s\n' "$token" >"$RUN/fence"
+		printf '%s\n' "$token" >"$RUN/fence" || return 1
 	done
 }
 
 stop_events() {
+	[ -z "$event_guard" ] || kill "$event_guard" 2>/dev/null
+	[ -z "$event_guard" ] || wait "$event_guard" 2>/dev/null
+	exec 7>&-
 	[ -z "$event_listener" ] || kill "$event_listener" 2>/dev/null
 	[ -z "$event_reader" ] || kill "$event_reader" 2>/dev/null
 	[ -z "$event_listener" ] || wait "$event_listener" 2>/dev/null
 	[ -z "$event_reader" ] || wait "$event_reader" 2>/dev/null
-	event_listener='' event_reader=''
+	event_listener='' event_reader='' event_guard=''
 }
 
 event_barrier() {
@@ -291,7 +302,8 @@ event_barrier() {
 	end=$(( $(now) + 5 ))
 	while [ "$(now)" -lt "$end" ]; do
 		kill -0 "$event_listener" 2>/dev/null &&
-			kill -0 "$event_reader" 2>/dev/null || return 1
+			kill -0 "$event_reader" 2>/dev/null &&
+			kill -0 "$event_guard" 2>/dev/null || return 1
 		ubus -t 1 send mf832s.fence "{\"token\":$fence}" >/dev/null 2>&1 || return 1
 		[ "$(cat "$RUN/fence" 2>/dev/null)" = "$fence" ] && return 0
 		sleep 1
@@ -300,25 +312,39 @@ event_barrier() {
 }
 
 ensure_events() {
-	if [ -n "$event_listener" ] && [ -n "$event_reader" ] &&
-		kill -0 "$event_listener" 2>/dev/null && kill -0 "$event_reader" 2>/dev/null; then
+	if [ -n "$event_listener" ] && [ -n "$event_reader" ] && [ -n "$event_guard" ] &&
+		kill -0 "$event_listener" 2>/dev/null && kill -0 "$event_reader" 2>/dev/null &&
+		kill -0 "$event_guard" 2>/dev/null; then
 		return 0
 	fi
 	stop_events
 	event_epoch=$((event_epoch + 1))
-	rm -f "$RUN/events" "$RUN/fence"
-	mkfifo "$RUN/events" || return 1
+	rm -f "$RUN/events" "$RUN/fence" "$RUN/lifetime"
+	mkfifo "$RUN/events" "$RUN/lifetime" || return 1
+	exec 7<>"$RUN/lifetime" || return 1
 	printf '0\n' >"$RUN/iface-sequence"
-	( exec 9>&-; read_events <"$RUN/events" ) &
+	( exec 9>&- 7>&-; read_events <"$RUN/events" ) &
 	event_reader=$!
-	( exec 9>&-; exec ubus -S listen network.interface mf832s.fence >"$RUN/events" 2>/dev/null ) &
+	( exec 9>&- 7>&-; exec ubus -S listen network.interface mf832s.fence >"$RUN/events" 2>/dev/null ) &
 	event_listener=$!
+	# Open the read end before forking: a crash must not leave the guard in open().
+	exec 6<"$RUN/lifetime" || return 1
+	(
+		exec 9>&- 7>&-
+		# EOF also arrives on SIGKILL/crash, when normal cleanup cannot run.
+		while IFS= read -r line; do :; done <&6
+		kill "$event_listener" "$event_reader" 2>/dev/null
+		rm -rf "$RUN"
+	) &
+	event_guard=$!
+	exec 6<&-
 	event_barrier
 }
 
 transaction_valid() {
 	kill -0 "$event_listener" 2>/dev/null &&
-		kill -0 "$event_reader" 2>/dev/null || return 1
+		kill -0 "$event_reader" 2>/dev/null &&
+		kill -0 "$event_guard" 2>/dev/null || return 1
 	same_generation && network_config "$net" && network_status "$net" || return 1
 	[ "$(interface_event)" = "$attempt_event" ] || return 1
 	case "$transaction_mode" in
@@ -359,7 +385,7 @@ query() {
 	} >"$RUN/query.chat"
 	# Transcript is private and never passed to logger (it may contain an APN).
 	(
-		exec 9>&-
+		exec 9>&- 7>&-
 		exec chat -S -s -V -f "$RUN/query.chat" <"$at" >"$at" 2>"$RUN/response"
 	) &
 	child=$!
@@ -422,7 +448,7 @@ undefined_context() {
 begin_transaction() {
 	transaction_end=$(( $(now) + transaction_timeout ))
 	(
-		exec 9>&-
+		exec 9>&- 7>&-
 		exec stty -F "$at" 115200 raw -echo clocal 2>/dev/null
 	) &
 	child=$!
@@ -555,7 +581,7 @@ recover() {
 	rc=1
 	if begin_transaction && recovery_ready && query 'AT+CFUN=0'; then
 		(
-			exec 9>&-
+			exec 9>&- 7>&-
 			exec sleep 2
 		) &
 		child=$!
@@ -654,9 +680,8 @@ reconcile() {
 		# enabled=1 delegates only this validated target's pending DHCP to us.
 		same_generation && network_config "$net" && network_status "$net" &&
 			[ "$up" = false ] && [ "$pending" = true ] || return
+		coordinate_pending || { retry; return; }
 		log 'Coordinating target pending DHCP before AT activation'
-		owned_device=$net owned_usb=$usb owned_generation=$generation
-		network_down || { retry; return; }
 		# Drain our own synchronous netifd down event before opening a new attempt.
 		event_barrier || { retry; return; }
 		same_generation && network_config "$net" && network_status "$net" &&
@@ -707,7 +732,7 @@ reconcile() {
 }
 
 load_config || { log 'Disabled or invalid configuration (explicit AT selection required)'; exit 1; }
-for tool in chat stty ubus jsonfilter flock; do
+for tool in chat stty ubus jsonfilter flock mkfifo mktemp; do
 	command -v "$tool" >/dev/null 2>&1 || { log "Required tool missing: $tool"; exit 1; }
 done
 # The kernel releases this persistent inode's lock even on a monitor crash.
@@ -715,6 +740,8 @@ exec 9>"$LOCK" || exit 1
 flock -n 9 || exit 0
 rm -rf "$RUN"
 mkdir "$RUN" || exit 1
+# An orphan from a crashed instance must never write into a replacement's state.
+RUN=$(mktemp -d "$RUN/instance.XXXXXX") || exit 1
 printf '%s\n' "$$" >"$RUN/pid"
 monitor_pid=$$
 trap 'cleanup; exit 0' TERM INT
@@ -724,7 +751,7 @@ while :; do
 	reconcile
 	# Events cancel work but do not reset backoff; polling catches missed events.
 	(
-		exec 9>&-
+		exec 9>&- 7>&-
 		exec sleep "$poll_interval"
 	) &
 	child=$!

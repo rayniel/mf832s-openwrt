@@ -7,6 +7,8 @@ trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 sed '/^\. \/lib\/functions.sh$/d; /^load_config ||/,$d' \
 	"$ROOT/package/mf832s/files/mf832s-monitor" >"$TMP/functions" || exit 1
 . "$TMP/functions"
+sed -n '/^ensure_events() {/,/^}/p; /^event_barrier() {/,/^}/p' \
+	"$TMP/functions" >"$TMP/real-events"
 RUN=$TMP
 TRACE=$TMP/trace
 
@@ -34,6 +36,13 @@ config_get() {
 		*) fail "unexpected config lookup $config:$3";;
 	esac
 	eval "$1=\$value"
+}
+uci() {
+	case "$*" in
+		'-q get mf832s.main.enabled') printf '%s\n' "$cfg_enabled";;
+		'-q get mf832s.main.interface') printf '%s\n' "$cfg_interface";;
+		*) fail "unexpected UCI operation: $*";;
+	esac
 }
 usb_parent() { printf '%s\n' "$physical_usb"; }
 stamp() { printf '%s\n' "$physical_generation"; }
@@ -67,6 +76,13 @@ ubus() {
 	case "$*" in
 		'-t 2 call network.interface.modem status')
 			[ "$status_ok" = 1 ] || return 1
+			# Simulate a lease completing between pending detection and coordination.
+			if [ "$online_on_check" -gt 0 ]; then
+				count=$(cat "$RUN/status-count")
+				count=$((count + 1))
+				printf '%s\n' "$count" >"$RUN/status-count"
+				[ "$count" -ne "$online_on_check" ] || fake_up=true
+			fi
 			printf '{"up":%s,"pending":%s,"available":%s,"device":"%s","l3_device":"%s"}\n' \
 				"$fake_up" "$fake_pending" "$fake_available" "$fake_device" "$fake_l3"
 			;;
@@ -74,11 +90,18 @@ ubus() {
 			printf 'DOWN modem\n' >>"$TRACE"
 			[ "$down_ok" = 1 ] || return 1
 			fake_up=false fake_pending=false queued_down=1
+			if [ "$real_events" = 1 ]; then
+				printf '{ "network.interface": {"interface":"modem","action":"ifdown"} }\n' >"$SIM_FEED"
+			fi
 			;;
 		'-t 2 call network.interface.modem up')
 			printf 'UP modem\n' >>"$TRACE"
 			fake_pending=true
 			;;
+		'-t 1 call service signal '*)
+			printf 'WAKE\n' >>"$TRACE";;
+		'-t 1 send mf832s.fence '*)
+			printf '{ "mf832s.fence": %s }\n' "$5" >"$SIM_FEED";;
 		*) fail "unexpected ubus operation: $*";;
 	esac
 }
@@ -116,9 +139,12 @@ reset() {
 	usb=/usb/modem at=/dev/ttyUSB0 net=usb0
 	fake_up=false fake_pending=false fake_available=true fake_device=usb0 fake_l3=usb0
 	status_ok=1 down_ok=1 pdp_active=1 events_ok=1 queued_down=0
+	real_events=0
+	online_on_check=0
+	printf '0\n' >"$RUN/status-count"
 	clock=100 sequence=0 event_epoch=1
 	printf '0\n' >"$RUN/iface-sequence"
-	event_listener=$$ event_reader=$$
+	event_listener=$$ event_reader=$$ event_guard=$$
 	owned_device='' owned_usb='' owned_generation='' owned_event='' owned_online=0
 	next_try=0 lease_deadline=0 interrupted=0 transaction_active=0 health_next=0
 	health_bad=0 recover_bad=0 recover_next=0 diagnostic=''
@@ -284,6 +310,31 @@ assert_count 'UP modem' 0
 printf 'ok - failed teardown or listener never permits activation/DHCP\n'
 
 reset
+fake_pending=true online_on_check=3
+reconcile
+assert_count 'DOWN modem' 0
+assert_count 'UP modem' 0
+[ -z "$owned_device" ] || fail 'coordination claimed an interface that became online'
+printf 'ok - pending that becomes online during recheck is never adopted or stopped\n'
+
+reset
+INTERFACE=wan ACTION=ifdown
+# BusyBox accepts signal names here; the host's dash builtin does not.
+kill() {
+	[ "$*" != '-l USR1' ] || { printf '10\n'; return; }
+	command kill "$@"
+}
+. "$ROOT/package/mf832s/files/20-mf832s-iface"
+assert_count 'WAKE' 0
+INTERFACE=modem
+. "$ROOT/package/mf832s/files/20-mf832s-iface"
+assert_count 'WAKE' 1
+cfg_enabled=0
+. "$ROOT/package/mf832s/files/20-mf832s-iface"
+assert_count 'WAKE' 1
+printf 'ok - packaged iface hook only wakes the enabled configured target\n'
+
+reset
 recover_mode=cfun_cycle recover_threshold=1
 fail_at='AT+CPIN?'
 reconcile
@@ -302,6 +353,41 @@ fake_pending=true
 await_child 999 && fail 'child survived concurrent external DHCP'
 [ -z "$child" ] || fail 'cancelled AT child was not reaped'
 printf 'ok - in-flight serial child is cancelled when target state changes\n'
+
+# Combine real listener restart/epoch handling with the production reconcile logic.
+mkdir "$TMP/bin" "$TMP/reconcile-events"
+cp "$ROOT/package/mf832s/tests/events.sh" "$TMP/bin/ubus"
+chmod +x "$TMP/bin/ubus"
+PATH=$TMP/bin:$PATH
+SIM_FEED=$TMP/integration-feed
+export SIM_FEED
+mkfifo "$SIM_FEED"
+exec 8<>"$SIM_FEED"
+RUN=$TMP/reconcile-events
+reset
+real_events=1 monitor_pid=$$
+event_listener='' event_reader='' event_guard=''
+. "$TMP/real-events"
+trap wake USR1
+connect
+online
+kill "$event_listener"
+wait "$event_listener" 2>/dev/null || :
+reconcile
+assert_count 'DOWN modem' 1
+assert_count 'AT+ZGACT=1,1' 1
+reconcile
+assert_count 'AT+ZGACT=1,1' 1
+retry_time
+reconcile
+assert_count 'DOWN modem' 1
+assert_count 'AT+ZGACT=1,1' 2
+assert_order
+stop_events
+exec 8>&-
+trap - USR1
+RUN=$TMP
+printf 'ok - real listener restart invalidates owned online attempt once, with backoff\n'
 
 # Exercise the actual event reader with the one-line ubus listen envelope.
 reset

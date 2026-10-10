@@ -54,16 +54,43 @@ event_barrier || exit 1
 [ "$(interface_event)" != "$initial" ]
 [ "$(cat "$RUN/iface-sequence")" = 1 ]
 printf 'ok - real FIFO reader/fences preserve fast target edges and ignore other interfaces\n'
-old_listener=$event_listener old_reader=$event_reader old_epoch=$event_epoch
+old_listener=$event_listener old_reader=$event_reader old_guard=$event_guard old_epoch=$event_epoch
 kill "$event_listener"
 wait "$event_listener" 2>/dev/null || :
 ensure_events || exit 1
 [ "$event_epoch" -gt "$old_epoch" ]
 ! kill -0 "$old_listener" 2>/dev/null
 ! kill -0 "$old_reader" 2>/dev/null
-listener=$event_listener reader=$event_reader
+! kill -0 "$old_guard" 2>/dev/null
+listener=$event_listener reader=$event_reader guard=$event_guard
 stop_events || exit 1
 ! kill -0 "$listener" 2>/dev/null
 ! kill -0 "$reader" 2>/dev/null
-printf 'ok - listener restart changes epoch and cleanup reaps both children\n'
+! kill -0 "$guard" 2>/dev/null
+printf 'ok - listener restart changes epoch and cleanup reaps all event children\n'
+
+# Simulate a monitor killed without cleanup, with a distinct private instance directory.
+sh -c '
+	. "$1"
+	RUN=$2
+	PATH=$3:$PATH
+	mkdir "$RUN"
+	monitor_pid=$$
+	interface=modem
+	trap ":" USR1
+	ensure_events || exit 1
+	printf "%s\n" "$$" >"$4"
+	exec sleep 30
+' sh "$TMP/functions" "$TMP/crashed-instance" "$TMP/bin" "$TMP/crash-ready" &
+crashed=$!
+end=$(( $(date +%s) + 8 ))
+while [ ! -f "$TMP/crash-ready" ] && [ "$(date +%s)" -lt "$end" ]; do sleep 1; done
+[ -f "$TMP/crash-ready" ]
+kill -KILL "$crashed"
+wait "$crashed" 2>/dev/null || :
+end=$(( $(date +%s) + 5 ))
+while [ -d "$TMP/crashed-instance" ] && [ "$(date +%s)" -lt "$end" ]; do sleep 1; done
+[ ! -d "$TMP/crashed-instance" ]
+[ -d "$RUN" ]
+printf 'ok - abrupt monitor death closes lifetime pipe and removes only its private state\n'
 printf 'All event-listener regression tests passed\n'
