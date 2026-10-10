@@ -1,333 +1,164 @@
-MF832S OpenWrt package
-=====================
+# MF832S OpenWrt package
 
-本包实现 ZTE AT 控制面 + USB Ethernet 数据面。procd 管理前台监控进程，
-hotplug 仅发送有界通知，netifd DHCP 管理地址、路由、DNS 和租约续期。
-不要再复制旧 etc/ 脚本，不要使用 unmanaged 接口或手工运行 udhcpc。
+This package provides a ZTE MF832S control-plane + USB Ethernet data-plane integration for OpenWrt/LEDE.
 
-目标接口基线：OpenWrt 24.10（procd、netifd、UCI、opkg）。
-这不是实机兼容性认证：尚未在 SDK 或 MF832S 硬件上验证。
-原 18.06.4 使用说明不能作为新包兼容性依据。其他分支须重新检查
-包名、netifd 配置、BusyBox applet 及包管理器。
-单设备 MVP 不实现 PPP、QMI、通用 NCM 控制协议、SIM PIN 解锁或 IPv6 配置。
-IPV4V6 PDP 不等于 OpenWrt 已配置 IPv6。
+## What it does
 
-1. 先确认硬件，不要安装所有驱动
------------------------------
-默认 VID/PID 19d2:0199 来自旧脚本，不限定 bcdDevice 固件版本。
-实机冷插入后检查：
+- Uses `chat`/AT commands to initialize and activate the modem.
+- Lets `netifd` manage DHCP, routes, DNS, and renewals.
+- Watches USB and interface events through `procd` and hotplug notifications.
+- Avoids a second `udhcpc`, avoids global `network reload`, and avoids guessing your WAN layout.
 
-  logread
-  ls /sys/bus/usb/devices/
-  readlink -f /sys/class/tty/ttyUSB*/device
-  readlink -f /sys/class/net/*/device
+## Requirements
 
-检查对应 USB 父目录中的 idVendor、idProduct、serial、busnum、devnum，
-USB 接口目录中的 bInterfaceNumber 和 driver 链接。记录哪个串口是 AT 口，
-哪个网卡属于同一个 USB 设备；不能仅凭 ttyUSB0 或 eth1 的名称判断。
-usbutils/lsusb 仅用于可选诊断。
+- OpenWrt 24.10 or a compatible release family.
+- A working MF832S modem with the correct USB drivers for your hardware.
+- `coreutils-stty` from the `packages` feed.
+- A proper DHCP interface in `/etc/config/network`.
 
-按实际绑定驱动选择：
-  option       -> kmod-usb-serial-option
-  rndis_host   -> kmod-usb-net-rndis
-  cdc_ether    -> kmod-usb-net-cdc-ether
-  cdc_ncm      -> kmod-usb-net-cdc-ncm
+This package does not auto-install every possible driver and does not perform unverified USB mode switching.
 
-安装串口驱动和一个已确认的数据面驱动。基础 usb-serial、usb-serial-wwan、
-usb-net 通常由这些驱动的依赖闭包引入，不重复强制声明。
-没有 Huawei 专用驱动证据，不安装 kmod-usb-net-huawei-cdc-ncm。
-只有冷插入先进入存储模式、且目标软件源有适用切换规则时才安装 usb-modeswitch；
-本包不提供未经验证的 USB 模式切换规则，也不写入内核 new_id。
+## Quick start
 
-包 Makefile 仅声明实际用户空间依赖：
-busybox、chat、coreutils-stty、flock、netifd、uci、ubus、procd、jsonfilter。
-chat 是独立包，不要求安装 ppp、comgt-ncm、LuCI PPP/NCM/QMI。
-24.10 的 BusyBox 默认未启用 stty，因此明确依赖 coreutils-stty；
-flock 提供崩溃后自动释放的单实例锁，不使用容易遗留的 mkdir 锁。
-硬件未知时不猜测 kmod 依赖；因此本包不是自动安装所有驱动的硬件元包。
-自定义固件须包含所需 BusyBox 工具及 netifd 所用的 udhcpc applet。
-内核模块必须匹配设备固件的目标、版本及内核 ABI，不能从其他版本混装。
+1. Install the package and its runtime dependencies.
+2. Confirm which USB device actually belongs to the modem.
+3. Confirm the AT control port.
+4. Create a DHCP interface bound to the modem’s USB Ethernet device.
+5. Enable and start the service.
 
-2. 使用官方 SDK/buildroot 构建
-----------------------------
-源码结构：
-  package/mf832s/Makefile
-  package/mf832s/files/mf832s.config
-  package/mf832s/files/mf832s.init
-  package/mf832s/files/mf832s-monitor
-  package/mf832s/files/mf832s-status
-  package/mf832s/files/20-mf832s
-  package/mf832s/files/20-mf832s-net
-  package/mf832s/files/20-mf832s-iface
-  LICENSE
+## Example setup
 
-保留仓库布局：Makefile 的 Build/Prepare 从 ../../LICENSE 复制许可证。
-例如将完整仓库放到 SDK 的 package/mf832s-openwrt/；不要只复制内层包目录。
-安装并配置目标平台官方 SDK，使用该分支配套的 feeds：
+You can use any logical interface name. The name is not important; the bound `device` is.
 
-  ./scripts/feeds update packages
-  ./scripts/feeds install coreutils
-
-coreutils-stty 来自 packages feed，其余直接依赖来自 OpenWrt 基础源码。
-在 menuconfig 的 Network / WWAN 选择 mf832s，随后使用 SDK 标准包目标构建：
-
-  make package/mf832s-openwrt/package/mf832s/compile V=s
-
-若采用不同源码挂载目录，调整目标路径。从 SDK bin/packages/ 查找生成的包。
-本包是 PKGARCH=all 的脚本包，没有编译器或额外构建依赖；
-这不代表 kmod 跨架构通用。不要在本仓库根目录直接运行 make 期待生成固件。
-24.10 用 opkg 安装生成的 ipk；其他分支按其原生包管理器处理。
-需先提供/安装对应软件源中的运行时依赖和实机确认的 USB 驱动。
-
-参考：
-https://openwrt.org/docs/guide-developer/packages
-https://openwrt.org/docs/guide-developer/toolchain/using_the_sdk
-https://github.com/openwrt/openwrt/blob/openwrt-24.10/package/network/services/ppp/Makefile
-https://github.com/openwrt/openwrt/blob/openwrt-24.10/package/kernel/linux/modules/usb.mk
-https://github.com/openwrt/openwrt/blob/openwrt-24.10/package/kernel/linux/modules/usb-net.mk
-https://github.com/openwrt/openwrt/blob/openwrt-24.10/package/utils/busybox/Config-defaults.in
-https://github.com/openwrt/packages/blob/openwrt-24.10/utils/coreutils/Makefile
-https://github.com/openwrt/openwrt/blob/openwrt-24.10/package/utils/util-linux/Makefile
-
-3. 配置网络与服务
-----------------
-安装默认不拨号，不创建网络接口，不修改防火墙或用户 WAN。
-/etc/config/mf832s 是升级保留的配置文件；程序资源不作为 conffile。
-没有 uci-defaults：本包不应通过一次性脚本替用户猜测网卡或改动 WAN。
-
-先停用或删除以前手工安装的 /etc/hotplug.d/usb/20-mf832s.sh，
-并停止旧手工 udhcpc。旧 /etc/chatscripts/mf832s*.chat 不再使用。
-在 LuCI 或 UCI 创建独立的 DHCP 逻辑接口，按已验证的 USB 网卡绑定：
-
-  config interface 'mf832s'
-      option proto 'dhcp'
-      option device '实际USB网卡名'
-      option auto '0'
-
-仍推荐 auto=0，使本服务在 AT 激活成功后启动接口，减少开机竞态。
-enabled=1 表示明确委托本服务管理这个目标连接，包括协调它提前进入的 DHCP
-pending；服务会复核 DHCP 配置、运行状态、同一 USB 归属和枚举代次，只停止
-该目标的 pending，再执行 AT，成功后重新请求 netifd up。不操作其他 WAN/LAN。
-这不是依靠 auto=0 规避状态机缺陷；开机自动启动、LuCI 或监控重启留下的
-pending 也会被有界协调。已在线但不属于当前监控实例的接口不被接管或射频重置；
-例如进程重启时已有租约，先保持只读健康检查，下一次离线/pending 才开始新尝试。
-不得使用 bridge、unmanaged、其他协议或绑定不属于该 USB 父设备的网卡。
-服务校验已有接口，不写 network UCI、不执行全局 network reload。
-需要 LAN 共享上网时，用户显式将这个逻辑接口加入合适的 WAN 防火墙区，
-检查转发、masquerading、路由 metric 和 DNS；本包不会覆盖这些策略。
-
-编辑 /etc/config/mf832s，设置运营商 APN、确认的 AT 口选择及设备标识；
-缺少明确 AT 口选择时拒绝猜测。配置格式和默认值见安装的配置文件。
-配置节是 config mf832s 'main'；仅支持一个监控实例：
-
-  enabled             0          确认配置后改为 1
-  interface           mf832s     已创建的 DHCP 逻辑接口
-  vid / pid           19d2/0199  四位十六进制 USB ID
-  usb_path / serial   空         多设备时按拓扑名/序列号进一步筛选
-  at_interface        空         已验证 AT 口的两位十六进制 bInterfaceNumber
-  at_device           空         或明确指定 /dev/ttyUSBn、/dev/ttyACMn
-  net_device          空         自动关联唯一网卡，或指定并校验同设备归属
-  apn                 空         默认依赖固件/运营商允许空 APN，建议明确设置
-  pdp_type / cid      IPV4V6/1   支持 IP、IPV6、IPV4V6；CID 1..16
-  query_timeout       5          单条 AT 查询超时，秒（1..30）
-  transaction_timeout 45         整轮 AT 操作上限，秒（5..300）
-  poll_interval       10         周期状态检查间隔，秒（1..300）
-  retry_initial       5          初始退避，秒（1..300）
-  retry_max           120        最大退避，秒（不小于初始值，最大 3600）
-  dhcp_timeout        60         租约等待窗口，秒（5..600）
-  health_interval     30         已获租约后的 AT 健康检查间隔，秒（5..600）
-  health_failures     3          连续失败阈值（1..10），仅重启本服务启动的接口
-  recover_mode        cfun_cycle 连续失败后的射频恢复；none 禁用，cfun_cycle 执行 CFUN=0/1
-  recover_threshold   3          连续 AT 健康/激活失败恢复阈值（1..100）
-  recover_cooldown    120        恢复尝试最小间隔，秒（0..86400），失败尝试也计入
-
-transaction_timeout 不得小于 query_timeout。多设备筛选结果、所选 AT 口或
-网卡存在歧义时拒绝连接。at_interface 和 at_device 同时设置时均须匹配。
-USB 拔插导致 ttyUSB 编号改变时优先使用已验证的 at_interface。
-APN 仅接受字母、数字、点、下划线、连字符；不允许 AT/chat 控制字符。
-不输出完整 AT 响应、SIM 身份或其他敏感数据。
-完成配置后将 enabled 设为 1，再运行：
-
-  /etc/init.d/mf832s enable
-  /etc/init.d/mf832s start
-
-修改配置后运行 /etc/init.d/mf832s reload。
-服务开机启用与配置 enabled 是两回事；enabled=0 时不创建监控实例。
-其他调制解调器管理器不得同时占用所选串口。
-
-### 示例：将 4G 逻辑接口绑定到已确认的 eth1
-
-仅在你已从 `/sys/class/net/eth1/device` 的 USB 父设备确认 `eth1`
-属于这台 MF832S 后使用。下面的 UCI 命令**会修改配置**，不猜 AT 口或 APN；
-`at_interface`、`at_device` 与 `apn` 必须按你自己的固件和实机调查结果填写。
+For example, if you want a logical interface named `4G` and the modem’s USB Ethernet device is `eth1`:
 
 ```sh
-# 修改 mf832s 服务目标和已核对的 DHCP 网络接口。
-uci set mf832s.main.interface='4G'
 uci set network.4G='interface'
 uci set network.4G.proto='dhcp'
 uci set network.4G.device='eth1'
 uci set network.4G.auto='0'
+```
+
+Then configure the MF832S service to use that interface:
+
+```sh
+uci set mf832s.main.interface='4G'
+```
+
+You still need to set the modem-specific values you have verified on your hardware:
+
+```sh
+# Fill in only values you have confirmed on the device.
+# uci set mf832s.main.at_interface='<verified USB bInterfaceNumber>'
+# or
+# uci set mf832s.main.at_device='/dev/ttyUSBn'
+# uci set mf832s.main.apn='<verified APN>'
 uci set mf832s.main.enabled='1'
-# 仅填写已确认的 AT 口选择和运营商 APN；不要照抄猜测的 ttyUSB 编号。
-# uci set mf832s.main.at_interface='<已核实的 USB bInterfaceNumber>'
-# 或 uci set mf832s.main.at_device='<已核实的 /dev/ttyUSBn 或 /dev/ttyACMn>'
-# uci set mf832s.main.apn='<已核实的运营商 APN>'
 uci commit network
 uci commit mf832s
+```
 
-# 检查目标配置；--check 只读，不会启动网络或访问串口。
-/etc/init.d/mf832s status --check 4G
-mf832s-status --check 4G
+Now enable and start the service:
 
-# 启用开机启动并启动监控服务。
+```sh
 /etc/init.d/mf832s enable
 /etc/init.d/mf832s start
 ```
 
-`/etc/init.d/mf832s enable` 会修改服务开机启用状态；`start` 会启动服务。
-如果 SSH 是经由 `4G` 建立，重启服务或接口可能断开当前连接，请先确保有 LAN/
-串口等恢复途径。不要通过本例全局 reload network，也不要手动运行 `udhcpc`。
-选择 `eth1` 本身不会启动 AT 激活服务。`enabled=1`、init 服务已 enable、
-有效且明确的 AT 口选择及正确 APN 都需要分别满足。
+## How the link works
+
+The service links to the **USB Ethernet device** you selected in the network interface, not to the interface name itself.
+
+That means:
+
+- `4G`, `wan4g`, or any other interface name is fine.
+- If the interface is bound to the modem’s real USB Ethernet device, the service can manage it.
+- If the interface is bound to the wrong device, the service will refuse to take it over.
+
+When the target interface is restarted, the service treats it as a new connection attempt and will run the AT initialization and activation flow again before letting DHCP proceed.
+
+## What happens during startup
+
+The service will roughly go through these stages:
+
+1. USB discovery
+2. Target interface validation
+3. Pending interface coordination
+4. AT initialization
+5. SIM readiness check
+6. Network registration
+7. Attachment
+8. PDP / ZTE activation
+9. DHCP start
+10. DHCP lease wait
+11. Online / health monitoring
+
+If the process stops early, check the current stage in the logs or status output.
+
+## Logs
+
+Use the system log to watch progress:
 
 ```sh
-# 运行日志与持续跟踪
 logread -e mf832s
 logread -f
+```
 
-# 当前服务/阶段状态；JSON 可选
+You should see stage-oriented messages such as device discovery, AT activation, DHCP start, lease waiting, or a stage-specific failure reason.
+
+## Status
+
+Check the service status from SSH:
+
+```sh
+/etc/init.d/mf832s status
 mf832s-status
 mf832s-status --json
-/etc/init.d/mf832s status
+mf832s-status --check 4G
+```
 
-# OpenWrt 对目标接口的独立状态，以及 USB/串口设备关联
+Useful network checks:
+
+```sh
 ubus call network.interface.4G status
+```
+
+Useful device checks:
+
+```sh
 readlink -f /sys/class/net/eth1/device
 readlink -f /sys/class/tty/ttyUSB*/device
 readlink -f /sys/class/tty/ttyACM*/device
 ls /sys/bus/usb/devices/
 ```
 
-状态中的 `stage` 和原因说明监控卡在哪一步；例如 `usb-discovery` 表示设备/
-驱动/VID/PID 或匹配存在歧义，`usb-associated` 后的 `DHCP-interface-validation`
-表示需核对 4G 的 DHCP 设备绑定，`serial-at`、`SIM`、`registration`、
-`attachment`、`PDP-validation`、`ZTE-activation` 表示 AT 流程进展，
-`DHCP-lease-waiting` 表示已请求 netifd 获取租约，`online` 只表示确实存在 IPv4
-租约，不代表公网可达。`mf832s-status --check 4G` 会检查服务目标与候选接口、
-协议和设备选项；不会自动更改配置或猜测 eth1/AT 口是否属于调制解调器。
+## Important behavior
 
-`Service: disabled` 表示 UCI 中 `enabled=0`；`not-enabled-at-boot` 表示 init
-服务未 enable；`failed`/`stale` 表示进程启动失败或最近实例已退出，请结合
-`logread -e mf832s` 查明原因。服务正在运行但处于 `AT-failure` 时，尚未请求本
-服务 DHCP；若显示 `DHCP-lease-waiting` 而没有 IPv4，则 AT 已完成但 netifd 尚未
-报告租约。分别对照 `/etc/init.d/mf832s status` 和
-`ubus call network.interface.4G status`，不要把 AT 成功、接口 up 或公网连通混为一谈。
+- `enabled=1` means the service is allowed to manage the target connection.
+- `auto=0` is still recommended so the service can control the activation sequence.
+- The package does not guess your AT port or APN.
+- The package does not modify firewall zones or global network settings.
+- A DHCP lease means the interface is up, but it does not automatically mean internet access is available.
+- AT activation success does not automatically mean DHCP has succeeded yet.
 
-4. 运行、恢复和排障
-------------------
-服务启动扫描已经插入的设备；USB/net/目标 iface 事件经 procd 唤醒检查，
-通知丢失时周期扫描仍可恢复。通知不会在 hotplug 中执行 AT、等待注册或 DHCP。
-net hotplug 不代表逻辑接口 up/down。监控另外监听 ubus network.interface 的
-目标 ifdown 事件，用单调序列记录连接结束，即使 down/up 发生在两轮扫描之间。
-iface hotplug 可能合并事件，所以不能单靠它记录快速重启；ifup/ifupdate 只唤醒，
-不触发重复激活。事件监听进程丢失时使原连接尝试失效，并有界重建监听，
-无法确认监听就绪则拒绝新连接操作。停止/reload 同时回收监听进程。
-服务自身 down 后通过 ubus 事件屏障（最长约 5 秒）确认先前事件已处理，
-不把自身 teardown 误当成下一轮连接。观察不到的事件仍依赖当前状态与周期扫描：
-不能保证在监听中断期间重建全部历史，也不能检测 netifd 不报告且状态不变的
-硬件内部重连；这些情况需要设备日志验证，不宣称零事件丢失。
-通知信号按目标系统解析 USR1 编号，不假定所有架构都使用信号 10。
-AT 操作串行执行并有超时；注册通过主动查询判断本地/漫游状态，
-不依赖两次 +CREG 通知或要求所有注册查询都支持。
-每轮连接尝试绑定当前 USB 枚举代次和接口事件序列，不复用上轮激活成功：
-冷启动、重新枚举、手动接口重启、netifd 重连或 DHCP 超时后的下一轮，
-都先完成 AT 初始化、SIM READY 检查、注册/附着和数据面激活，再由服务请求 DHCP。
-按照 MF832S 的硬件要求，每轮必须发送 AT+ZGACT=1,$cid，即使 CGACT?/ZGACT?
-仍报告 active；仅一次每尝试，不在 pending 轮询或正常在线健康检查重复发送。
-PDP 已激活时不解除上下文、不重复写 CGDCONT；CGATT=1 和 CGACT=1 仍只在
-安全确认必要时执行，未知上下文不盲目覆盖 APN。ZGACT 查询是安全状态参考，
-不是省略本轮 ZTE 激活的依据。该命令需要在实际固件上验证，不能当作通用蜂窝协议。
-AT+CFUN? 确认射频关闭时才启用射频，不反复重置已经启用的调制解调器。
-激活前关闭 AT 回显（尽力），要求 CPIN 为 READY，并查询 CSQ（私有诊断）。
-CGATT? 确认未附着时才执行 CGATT=1；未知状态则退避重试，不盲目写入。
-已有 DHCP 租约也会周期检查注册/PDP；连续失败达到阈值后才对拥有的接口重连。
-AT 子任务等待及每条查询前后复核配置、目标状态、事件序列和 USB 代次；
-期间外部 DHCP 启动、接口 down 或 USB 变化会取消旧尝试。DHCP 启动前再次通过
-事件屏障并复核。此方案不锁住外部 LuCI/netifd 操作，建议不同时运行其他管理器；
-外部提前启动的 pending 会被协调，而不是让服务再启动第二个 DHCP 客户端。
-恢复同时受 recover_threshold 和 recover_cooldown 限制，不替代指数退避；
-在线健康失败还须达到 health_failures，且仅对本服务拥有的接口执行 CFUN 恢复。
-USB hotplug 优先按 PRODUCT 或 sysfs 中的 VID/PID 过滤，信息缺失时保守通知。
+## Troubleshooting
 
-procd respawn 只恢复进程崩溃；网络失败使用有上限的退避间隔重试。
-设备消失/代次变化取消旧串口任务；DHCP 由 netifd 管理，没有第二个 udhcpc。
-AT 激活、DHCP pending、已获地址不是同一状态，公网探测不作为断网重置依据。
-停止/reload 取消本服务子任务；不会删除用户网络或防火墙配置。
-运行目录 /var/run/mf832s 权限为 0700，每个进程使用独立的 instance.* 私有子目录；
-停止时删除该实例的 PID、chat、响应和事件文件。事件子进程另有生命周期管道守护，
-监控被 SIGKILL/崩溃时也会关闭监听并删除旧实例状态，不能覆盖新实例的事件屏障。
-BusyBox 配置须提供 mkfifo 与 mktemp，缺少时启动检查明确报错。
-独立的 /var/run/mf832s.lock 权限为 0600，保留到重启，
-以防删除锁 inode 导致两个实例分别持锁；
-锁由内核在进程退出时释放，残留文件不是仍在运行的服务。
+If you created an interface such as `4G` and bound it to `eth1`, but DHCP still does not get an address:
 
-  logread -e mf832s
-  ubus call service list '{"name":"mf832s"}'
-  ubus call network.interface.mf832s status
-  mf832s-status
-  mf832s-status --json
-  mf832s-status --check 4G
-  /etc/init.d/mf832s stop
+1. Confirm `mf832s.main.interface` matches your network section name.
+2. Confirm `network.4G.proto` is `dhcp`.
+3. Confirm `network.4G.device` is the correct modem-owned USB Ethernet device.
+4. Confirm the AT port is explicitly selected.
+5. Confirm the APN is correct for your carrier.
+6. Check `logread -e mf832s` for the exact stage where it stopped.
+7. Check `ubus call network.interface.4G status` to see whether netifd is pending, up, or unavailable.
 
-若没有地址，依次检查 USB 驱动、AT 口归属、SIM/APN/注册、netifd DHCP 和防火墙。
-日志会区分设备发现失败、目标配置/状态拒绝、pending 协调、AT 失败阶段、
-AT 完成/DHCP 启动及 DHCP 超时退避。发现/配置拒绝按原因去重，AT/DHCP 失败
-按退避尝试输出，不逐次 pending 轮询刷屏；不输出完整响应、APN、SIM 身份或 serial。
-若有“AT activation completed”却无地址，继续查 netifd/udhcpc 和 USB 数据面，
-这条日志只证明 AT 返回成功及 netifd 接受启动，不证明获得租约或公网可用。
-不要在调试时启动第二个 chat/串口管理器，也不要用手工 udhcpc 绕过 netifd。
-卸载前停止服务。标准包生命周期处理 init 注册；用户创建的 network/firewall
-配置保留，用户自行决定是否删除。升级保留 /etc/config/mf832s。
+If the interface is restarted, the service should re-run the activation flow. If it does not, the logs and status output are the first place to look.
 
-5. 无硬件回归测试
------------------
-在仓库根目录执行（不需要 OpenWrt、串口、root 或额外测试依赖）：
+## Development notes
 
-  sh package/mf832s/tests/state-machine.sh
-  busybox ash package/mf832s/tests/state-machine.sh
-  sh package/mf832s/tests/status.sh
-  sh package/mf832s/tests/init.sh
-  sh package/mf832s/tests/events.sh
-  busybox ash package/mf832s/tests/events.sh
-  sh -n package/mf832s/files/mf832s-monitor
-  sh -n package/mf832s/files/mf832s-status
-  sh -n package/mf832s/files/mf832s.init
-  sh -n package/mf832s/files/20-mf832s-iface
+This repository uses shell scripts and a small package Makefile. It is intended to be built with the OpenWrt SDK.
 
-测试加载生产 Shell 函数，模拟 UCI、netifd、AT 响应和 USB 代次，校验每次服务
-DHCP up 之前有新的 ZGACT 激活；覆盖无 owned 的 pending、接口/监控重启、
-active 状态、DHCP 超时与退避、正常健康检查、安全拒绝、重复/快速事件、
-USB 变化、事务竞态、AT 失败、恢复限频和目标事件过滤。
-events.sh 直接启动生产 FIFO 监听器，用本地命令替身验证事件屏障、
-快速 down/up、监听重启的代次失效、事件子进程回收及监控被强制终止的清理。
-status.sh 检查只读 4G 配置诊断、JSON 转义及无活 PID 时不报告历史 IPv4 在线。
-init.sh 验证 disabled/invalid 启动日志及 procd stdout/stderr 兜底转发。
-模拟测试不替代 SDK 安装验证、真实 ubus/hotplug 时序及硬件 AT/数据面验证。
+## License
 
-6. 验收清单（需要 SDK 与实机，不代表已经通过）
------------------------------------------
-- 包构建、依赖闭包、文件权限、安装路径及配置保留正确。
-- ubus listen/send 可用且服务有权限；监听不可用时拒绝连接操作，不降级复用旧激活。
-- 无设备安装成功；默认不拨号、不修改 WAN；升级和卸载无遗留进程。
-- 开机前/后插入，串口/网卡延迟出现，重命名，多 USB 设备和错误 AT 口。
-- 重复事件、快速拔插、AT/注册/DHCP 期间拔出、stop/reload 清理。
-- 超时、SIM 不就绪、APN 错误、本地/漫游注册及不支持的注册查询。
-- 未定义 CID 可安全初始化；查询失败或格式不明时不能覆盖可能活动的 PDP。
-- PDP 已激活但逻辑接口未启动；DHCP 无响应、续租和租约恢复。
-- 非 MF832S 事件不影响后续 hotplug 处理器；设备关联失败时拒绝操作。
-- 非 DHCP、网卡不匹配或用户网络配置改变时不操作其他接口。
-- 配置换行/引号/控制字符被拒绝；临时文件私有，不记录敏感 AT 内容。
-
-许可证：仓库提供 GPL version 3 正文，包元数据采用 GPL-3.0-only，
-不从许可证末尾应用示例推断 “or later” 授权。
+GPL-3.0-only
