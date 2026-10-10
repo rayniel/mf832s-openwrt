@@ -2,12 +2,12 @@
 
 This package provides a ZTE MF832S control-plane + USB Ethernet data-plane integration for OpenWrt/LEDE.
 
-## What it does
+## 自动联动行为
 
-- Uses `chat`/AT commands to initialize and activate the modem.
-- Lets `netifd` manage DHCP, routes, DNS, and renewals.
-- Watches USB and interface events through `procd` and hotplug notifications.
-- Avoids a second `udhcpc`, avoids global `network reload`, and avoids guessing your WAN layout.
+- 安装后默认允许服务启动。
+- 程序在后台常驻扫描，未检测到对应卡托时保持静默。
+- 一旦检测到匹配的 MF832S USB 设备或相关网络事件，就自动进入 AT 初始化、注册、附着、ZT E 激活和 DHCP 流程。
+- 如果没有匹配设备，不会胡乱重启网络、不触发错误拨号、不猜 AT 口和 APN。
 
 ## Requirements
 
@@ -16,172 +16,38 @@ This package provides a ZTE MF832S control-plane + USB Ethernet data-plane integ
 - `coreutils-stty` from the `packages` feed.
 - A proper DHCP interface in `/etc/config/network`.
 
-This package does not auto-install every possible driver and does not perform unverified USB mode switching.
+## 热插拔与接口联动
 
-## Quick start
+逻辑接口名可以是 `4G`、`wan4g` 或任意名称；真正决定联动的是它绑定的 `device` 是否属于该 MF832S。
 
-1. Install the package and its runtime dependencies.
-2. Confirm which USB device actually belongs to the modem.
-3. Confirm the AT control port.
-4. Create a DHCP interface bound to the modem’s USB Ethernet device.
-5. Enable and start the service.
-
-## Example setup
-
-You can use any logical interface name. The name is not important; the bound `device` is.
-
-For example, if you want a logical interface named `4G` and the modem’s USB Ethernet device is `eth1`:
+例如：
 
 ```sh
 uci set network.4G='interface'
 uci set network.4G.proto='dhcp'
 uci set network.4G.device='eth1'
 uci set network.4G.auto='0'
-```
-
-Then configure the MF832S service to use that interface:
-
-```sh
 uci set mf832s.main.interface='4G'
-```
-
-You still need to set the modem-specific values you have verified on your hardware:
-
-```sh
-# Fill in only values you have confirmed on the device.
-# uci set mf832s.main.at_interface='<verified USB bInterfaceNumber>'
-# or
-# uci set mf832s.main.at_device='/dev/ttyUSBn'
-# uci set mf832s.main.apn='<verified APN>'
-uci set mf832s.main.enabled='1'
 uci commit network
 uci commit mf832s
 ```
 
-Now enable and start the service:
-
-```sh
-/etc/init.d/mf832s enable
-/etc/init.d/mf832s start
-```
-
-## How the link works
-
-The service links to the **USB Ethernet device** you selected in the network interface, not to the interface name itself.
-
-That means:
-
-- `4G`, `wan4g`, or any other interface name is fine.
-- If the interface is bound to the modem’s real USB Ethernet device, the service can manage it.
-- If the interface is bound to the wrong device, the service will refuse to take it over.
-
-When the target interface is restarted, the service treats it as a new connection attempt and will run the AT initialization and activation flow again before letting DHCP proceed.
-
-## What happens during startup
-
-The service will roughly go through these stages:
-
-1. USB discovery
-2. Target interface validation
-3. Pending interface coordination
-4. AT initialization
-5. SIM readiness check
-6. Network registration
-7. Attachment
-8. PDP / ZTE activation
-9. DHCP start
-10. DHCP lease wait
-11. Online / health monitoring
-
-If the process stops early, check the current stage in the logs or status output.
+接着重启接口或插入卡托时，服务会自动重新走一轮 AT 初始化和激活，再让 DHCP 请求租约。
 
 ## Logs
-
-Use the system log to watch progress:
 
 ```sh
 logread -e mf832s
 logread -f
 ```
 
-You should see stage-oriented messages such as device discovery, AT activation, DHCP start, lease waiting, or a stage-specific failure reason.
-
 ## Status
-
-Check the service status from SSH:
 
 ```sh
 /etc/init.d/mf832s status
 mf832s-status
 mf832s-status --json
-mf832s-status --check 4G
 ```
-
-Useful network checks:
-
-```sh
-ubus call network.interface.4G status
-```
-
-Useful device checks:
-
-```sh
-readlink -f /sys/class/net/eth1/device
-readlink -f /sys/class/tty/ttyUSB*/device
-readlink -f /sys/class/tty/ttyACM*/device
-ls /sys/bus/usb/devices/
-```
-
-## 重要行为
-
-- `enabled=1` 表示服务允许管理这个目标连接。
-- 仍然推荐 `auto=0`，这样服务才能控制 AT 初始化、激活和 DHCP 的顺序。
-- 本包不会猜你的 AT 口或 APN。
-- 本包不会修改防火墙区或全局网络设置。
-- 拿到 DHCP 租约只表示接口已经起来了，不代表一定能上网。
-- AT 激活成功，也不等于 DHCP 一定成功。
-
-## 使用示例：4G 接口绑定 eth1
-
-如果你创建了一个逻辑接口 `4G`，并把它绑定到 `eth1`，配置可以是：
-
-```sh
-uci set network.4G='interface'
-uci set network.4G.proto='dhcp'
-uci set network.4G.device='eth1'
-uci set network.4G.auto='0'
-uci set mf832s.main.interface='4G'
-uci set mf832s.main.enabled='1'
-uci commit network
-uci commit mf832s
-/etc/init.d/mf832s enable
-/etc/init.d/mf832s start
-```
-
-注意：
-
-- `4G` 只是名字，可以换成 `wan4g`, `lte0` or anything you prefer.
-- 真正决定联动的是 `device='eth1'` 是否确实属于这台 MF832S。
-- 只有当这个 `eth1` 确实是目标 USB 网卡时，服务才会接管。
-- 如果接口重启，服务会重新执行 AT 初始化与激活流程，再让 DHCP 继续。
-
-## 故障排查
-
-如果你创建了 `4G`，绑定了 `eth1`，但 DHCP 还是拿不到地址：
-
-1. 确认 `mf832s.main.interface` 和你的网络接口名一致。
-2. 确认 `network.4G.proto` 是 `dhcp`。
-3. 确认 `network.4G.device` 真的是这个卡托对应的 USB 网卡。
-4. 确认 AT 口已经明确设置。
-5. 确认 APN 是你运营商的正确值。
-6. 查看 `logread -e mf832s`，确认卡在哪个阶段。
-7. 查看 `ubus call network.interface.4G status`，确认是 pending、up 还是 unavailable。
-
-If the interface is restarted, the service should re-run the activation flow. If it does not, the logs and status output are the first place to look.
-
-## 开发说明
-
-本仓库主要由 shell 脚本和一个小型 package Makefile 组成，适合通过 OpenWrt SDK 构建。
 
 ## 许可证
 

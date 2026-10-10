@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=mf832s
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=4
+PKG_RELEASE:=5
 PKG_LICENSE:=GPL-3.0-only
 PKG_LICENSE_FILES:=LICENSE
 PKGARCH:=all
@@ -20,9 +20,10 @@ endef
 
 define Package/mf832s/description
   Supervised AT activation for a single ZTE MF832S, with DHCP managed by
-  netifd. Auto-starts only when a matching modem is detected; otherwise exits
-  quietly. Install the USB serial and network drivers matching your hardware
-  separately; no PPP, QMI or LuCI stack is required.
+  netifd. Starts automatically and silently waits for a matching modem; when a
+  modem is detected it performs AT activation and DHCP orchestration. Install
+  the USB serial and network drivers matching your hardware separately; no PPP,
+  QMI or LuCI stack is required.
 endef
 
 define Package/mf832s/conffiles
