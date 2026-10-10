@@ -1,0 +1,18 @@
+#!/bin/sh
+
+(
+	[ "$(uci -q get mf832s.main.enabled)" = 1 ] || exit 0
+	target=$(uci -q get mf832s.main.interface)
+	[ "$INTERFACE" = "${target:-mf832s}" ] || exit 0
+	case "$ACTION" in
+		ifup|ifdown|ifup-failed|ifupdate)
+			# Wake only; the monitor's ubus listener preserves down/up edges.
+			signal=$(kill -l USR1 2>/dev/null)
+			case "$signal" in
+				''|*[!0-9]*) :;;
+				*) ubus -t 1 call service signal "{\"name\":\"mf832s\",\"signal\":$signal}" >/dev/null 2>&1;;
+			esac
+			;;
+	esac
+	:
+)
