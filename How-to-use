@@ -160,7 +160,7 @@ uci commit mf832s
 
 注意：
 
-- `4G` 只是名字，可以换成 `wan4g`、`lte0` 或其他你喜欢的名字。
+- `4G` 只是名字，可以换成 `wan4g`, `lte0` or anything you prefer.
 - 真正决定联动的是 `device='eth1'` 是否确实属于这台 MF832S。
 - 只有当这个 `eth1` 确实是目标 USB 网卡时，服务才会接管。
 - 如果接口重启，服务会重新执行 AT 初始化与激活流程，再让 DHCP 继续。
@@ -177,7 +177,7 @@ uci commit mf832s
 6. 查看 `logread -e mf832s`，确认卡在哪个阶段。
 7. 查看 `ubus call network.interface.4G status`，确认是 pending、up 还是 unavailable。
 
-如果接口重启后服务没有重新走激活流程，优先看日志和状态输出。
+If the interface is restarted, the service should re-run the activation flow. If it does not, the logs and status output are the first place to look.
 
 ## 开发说明
 
