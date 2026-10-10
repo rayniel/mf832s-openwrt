@@ -5,15 +5,32 @@ STOP=10
 USE_PROCD=1
 
 start_service() {
-	local enabled
+	local enabled target
 	config_load mf832s
 	config_get_bool enabled main enabled 0
-	[ "$enabled" = 1 ] || return 0
+	config_get target main interface mf832s
+	if [ "$enabled" != 1 ]; then
+		logger -t mf832s 'Not starting: mf832s.main.enabled is 0; configure and enable the service explicitly'
+		return 0
+	fi
+	case "$target" in
+		''|*[!a-zA-Z0-9_.-]*)
+			logger -t mf832s 'Not starting: invalid target interface name in mf832s.main.interface'
+			return 0
+			;;
+	esac
+	logger -t mf832s "Starting monitor build=1.0.0-r3 for target interface=$target"
 	procd_open_instance
 	procd_set_param command /usr/sbin/mf832s-monitor
 	procd_set_param respawn 3600 5 5
 	procd_set_param term_timeout 10
+	procd_set_param stdout 1
+	procd_set_param stderr 1
 	procd_close_instance
+}
+
+status() {
+	/usr/sbin/mf832s-status "$@"
 }
 
 reload_service() {

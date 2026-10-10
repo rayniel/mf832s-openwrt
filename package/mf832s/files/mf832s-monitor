@@ -6,6 +6,7 @@ export PATH
 umask 077
 RUN=/var/run/mf832s
 LOCK=/var/run/mf832s.lock
+STATUS_FILE=/var/run/mf832s/status
 child=
 owned_device=
 owned_usb=
@@ -24,6 +25,16 @@ owned_event=
 attempt_event=
 transaction_mode=
 diagnostic=
+config_error=
+discovery_reason=
+validation_reason=
+stage=starting
+stage_reason='monitor starting'
+stage_started=0
+stage_updated=0
+state_health=unknown
+has_ipv4=false
+observed_ipv4=false
 event_reader=
 event_listener=
 event_guard=
@@ -36,6 +47,54 @@ notice() {
 	diagnostic=$1
 }
 now() { date +%s; }
+write_state() {
+	local tmp
+	[ -d "${STATUS_FILE%/*}" ] || return 1
+	tmp="${STATUS_FILE}.$$"
+	{
+		printf 'service=%s\n' "${state_service:-running}"
+		printf 'pid=%s\n' "${monitor_pid-}"
+		printf 'instance=%s\n' "${RUN:-}"
+		printf 'target=%s\n' "${interface:-}"
+		printf 'configured_net=%s\n' "${net_device:-}"
+		printf 'usb=%s\n' "${usb:-}"
+		printf 'at=%s\n' "${at:-}"
+		printf 'net=%s\n' "${net:-}"
+		printf 'stage=%s\n' "$stage"
+		printf 'reason=%s\n' "$stage_reason"
+		printf 'stage_started=%s\n' "$stage_started"
+		printf 'updated=%s\n' "$stage_updated"
+		printf 'retry_at=%s\n' "$next_try"
+		printf 'lease_deadline=%s\n' "$lease_deadline"
+		printf 'has_ipv4=%s\n' "$has_ipv4"
+		printf 'health=%s\n' "$state_health"
+	} >"$tmp" || { rm -f "$tmp"; return 1; }
+	chmod 600 "$tmp" && mv -f "$tmp" "$STATUS_FILE"
+}
+set_stage() {
+	local changed old_stage
+	changed=0
+	if [ "$stage" != "$1" ] || [ "$stage_reason" != "$2" ]; then
+		changed=1
+		old_stage=$stage
+		stage=$1
+		stage_reason=$2
+		stage_updated=$(now)
+		if [ "$old_stage" != "$stage" ] || [ "$stage_started" -eq 0 ]; then
+			stage_started=$stage_updated
+		fi
+		write_state
+		[ "${3:-}" = quiet ] || log "stage=$stage: $stage_reason"
+	elif [ "$stage_updated" -eq 0 ]; then
+		stage_updated=$(now)
+		stage_started=$stage_updated
+		write_state
+	fi
+}
+stage_failure() {
+	set_stage "$1" "$2" quiet
+	notice "stage=$1: $2"
+}
 cancel() {
 	interrupted=1
 	[ -z "$child" ] || kill "$child" 2>/dev/null
@@ -66,7 +125,7 @@ number() {
 load_config() {
 	config_load mf832s
 	config_get_bool enabled main enabled 0
-	[ "$enabled" = 1 ] || return 1
+	[ "$enabled" = 1 ] || { config_error=disabled; return 1; }
 	config_get interface main interface mf832s
 	config_get apn main apn ''
 	config_get pdp_type main pdp_type IPV4V6
@@ -89,12 +148,12 @@ load_config() {
 	config_get recover_mode main recover_mode cfun_cycle
 	config_get recover_threshold main recover_threshold 3
 	config_get recover_cooldown main recover_cooldown 120
-	valid_name "$interface" || return 1
+	valid_name "$interface" || { config_error=invalid-target-interface; return 1; }
 	# APNs cannot inject chat syntax or AT commands; the empty default is allowed.
-	case "$apn" in *[!a-zA-Z0-9._-]*) return 1;; esac
-	[ "${#apn}" -le 100 ] || return 1
-	case "$pdp_type" in IP|IPV6|IPV4V6) :;; *) return 1;; esac
-	case "$recover_mode" in none|cfun_cycle) :;; *) return 1;; esac
+	case "$apn" in *[!a-zA-Z0-9._-]*) config_error=invalid-apn-format; return 1;; esac
+	[ "${#apn}" -le 100 ] || { config_error=invalid-apn-length; return 1; }
+	case "$pdp_type" in IP|IPV6|IPV4V6) :;; *) config_error=invalid-pdp-type; return 1;; esac
+	case "$recover_mode" in none|cfun_cycle) :;; *) config_error=invalid-recovery-mode; return 1;; esac
 	number cid "$cid" 1 16 &&
 	number query_timeout "$query_timeout" 1 30 &&
 	number transaction_timeout "$transaction_timeout" 5 300 &&
@@ -105,26 +164,27 @@ load_config() {
 	number health_interval "$health_interval" 5 600 &&
 	number health_failures "$health_failures" 1 10 &&
 	number recover_threshold "$recover_threshold" 1 100 &&
-	number recover_cooldown "$recover_cooldown" 0 86400 || return 1
-	[ "$transaction_timeout" -ge "$query_timeout" ] || return 1
-	case "$vid$pid" in *[!0-9a-fA-F]*) return 1;; esac
-	[ "${#vid}" = 4 ] && [ "${#pid}" = 4 ] || return 1
+	number recover_cooldown "$recover_cooldown" 0 86400 || { config_error=invalid-timing-or-retry-setting; return 1; }
+	[ "$transaction_timeout" -ge "$query_timeout" ] || { config_error=transaction-timeout-before-query-timeout; return 1; }
+	case "$vid$pid" in *[!0-9a-fA-F]*) config_error=invalid-usb-vid-pid; return 1;; esac
+	[ "${#vid}" = 4 ] && [ "${#pid}" = 4 ] || { config_error=invalid-usb-vid-pid; return 1; }
 	vid=$(printf '%s' "$vid" | tr A-F a-f)
 	pid=$(printf '%s' "$pid" | tr A-F a-f)
-	case "$usb_path" in *[!0-9.-]*) return 1;; esac
+	case "$usb_path" in *[!0-9.-]*) config_error=invalid-usb-path; return 1;; esac
 	if [ -n "$at_interface" ]; then
-		case "$at_interface" in *[!0-9a-fA-F]*) return 1;; esac
-		[ "${#at_interface}" = 2 ] || return 1
+		case "$at_interface" in *[!0-9a-fA-F]*) config_error=invalid-at-interface; return 1;; esac
+		[ "${#at_interface}" = 2 ] || { config_error=invalid-at-interface; return 1; }
 		at_interface=$(printf '%s' "$at_interface" | tr A-F a-f)
 	fi
 	if [ -n "$at_device" ]; then
 		case "$at_device" in /dev/ttyUSB*) suffix=${at_device#/dev/ttyUSB};;
-			/dev/ttyACM*) suffix=${at_device#/dev/ttyACM};; *) return 1;; esac
-		case "$suffix" in ''|*[!0-9]*) return 1;; esac
+			/dev/ttyACM*) suffix=${at_device#/dev/ttyACM};; *) config_error=invalid-at-device; return 1;; esac
+		case "$suffix" in ''|*[!0-9]*) config_error=invalid-at-device; return 1;; esac
 	fi
-	[ -n "$at_interface$at_device" ] || return 1
-	[ -z "$net_device" ] || valid_name "$net_device" || return 1
+	[ -n "$at_interface$at_device" ] || { config_error=at-port-not-explicitly-selected; return 1; }
+	[ -z "$net_device" ] || valid_name "$net_device" || { config_error=invalid-network-device; return 1; }
 	backoff=$retry_initial
+	config_error=
 }
 
 usb_parent() {
@@ -158,8 +218,9 @@ discover() {
 		count=$((count + 1))
 		usb=$(readlink -f "$path")
 	done
-	[ "$count" = 1 ] || return 1
-	found_generation=$(stamp "$usb") || return 1
+	[ "$count" -gt 0 ] || { discovery_reason=usb-vid-pid-not-found; return 1; }
+	[ "$count" = 1 ] || { discovery_reason=multiple-matching-usb-modems; return 1; }
+	found_generation=$(stamp "$usb") || { discovery_reason=usb-device-not-ready; return 1; }
 	count=0
 	for tty_path in /sys/class/tty/ttyUSB* /sys/class/tty/ttyACM*; do
 		[ -e "$tty_path/device" ] || continue
@@ -183,7 +244,8 @@ discover() {
 		count=$((count + 1))
 		at=$candidate
 	done
-	[ "$count" = 1 ] || return 1
+	[ "$count" -gt 0 ] || { discovery_reason=selected-at-port-not-ready; return 1; }
+	[ "$count" = 1 ] || { discovery_reason=multiple-matching-at-ports; return 1; }
 	count=0
 	for path in /sys/class/net/*; do
 		candidate=${path##*/}
@@ -193,7 +255,9 @@ discover() {
 		count=$((count + 1))
 		net=$candidate
 	done
-	[ "$count" = 1 ]
+	[ "$count" -gt 0 ] || { discovery_reason=usb-network-device-not-ready; return 1; }
+	[ "$count" = 1 ] || { discovery_reason=multiple-matching-usb-network-devices; return 1; }
+	discovery_reason=discovered
 }
 
 network_config() {
@@ -201,26 +265,43 @@ network_config() {
 	config_load mf832s
 	config_get_bool managed main enabled 0
 	config_get selected main interface mf832s
-	[ "$managed" = 1 ] && [ "$selected" = "$interface" ] || return 1
+	[ "$managed" = 1 ] || { validation_reason=service-disabled; return 1; }
+	[ "$selected" = "$interface" ] || { validation_reason=service-target-mismatch; return 1; }
 	config_load network
 	config_get section_type "$interface" TYPE
 	config_get proto "$interface" proto
 	config_get device "$interface" device
-	[ "$section_type" = interface ] && [ "$proto" = dhcp ] && [ "$device" = "$1" ]
+	[ "$section_type" = interface ] || { validation_reason=target-interface-missing; return 1; }
+	[ "$proto" = dhcp ] || { validation_reason=target-protocol-not-dhcp; return 1; }
+	[ "$device" = "$1" ] || { validation_reason=target-device-not-discovered-usb-net; return 1; }
+	validation_reason=valid
 }
 
 network_status() {
-	status=$(ubus -t 2 call "network.interface.$interface" status 2>/dev/null) || return 1
+	status=$(ubus -t 2 call "network.interface.$interface" status 2>/dev/null) ||
+		{ validation_reason=network-status-unavailable; return 1; }
 	up=$(jsonfilter -s "$status" -e '@.up')
 	pending=$(jsonfilter -s "$status" -e '@.pending')
 	available=$(jsonfilter -s "$status" -e '@.available')
 	l3=$(jsonfilter -s "$status" -e '@.l3_device')
 	status_device=$(jsonfilter -s "$status" -e '@.device')
-	[ "$up" = true ] || [ "$up" = false ] || return 1
-	[ "$pending" = true ] || [ "$pending" = false ] || return 1
-	[ "$available" = true ] || [ "$available" = false ] || return 1
-	[ -z "$l3" ] || [ "$l3" = "$1" ] || return 1
-	[ -z "$status_device" ] || [ "$status_device" = "$1" ] || return 1
+	ipv4=$(jsonfilter -s "$status" -e '@["ipv4-address"][0].address')
+	has_ipv4=false
+	printf '%s\n' "$ipv4" | awk -F. '
+		NF==4 {
+			for (i=1;i<=4;i++) {
+				if ($i !~ /^[0-9]+$/ || length($i)>3 || $i>255) exit 1
+			}
+			valid=1
+		}
+		END { exit !valid }
+	' && has_ipv4=true
+	[ "$up" = true ] || [ "$up" = false ] || { validation_reason=invalid-netifd-status; return 1; }
+	[ "$pending" = true ] || [ "$pending" = false ] || { validation_reason=invalid-netifd-status; return 1; }
+	[ "$available" = true ] || [ "$available" = false ] || { validation_reason=invalid-netifd-status; return 1; }
+	[ -z "$l3" ] || [ "$l3" = "$1" ] || { validation_reason=netifd-l3-device-mismatch; return 1; }
+	[ -z "$status_device" ] || [ "$status_device" = "$1" ] || { validation_reason=netifd-device-mismatch; return 1; }
+	validation_reason=valid
 }
 
 network_down() {
@@ -247,6 +328,12 @@ coordinate_pending() {
 }
 
 cleanup() {
+	state_service=stopped
+	monitor_pid=
+	stage=stopped
+	stage_reason='monitor stopped by init service'
+	stage_updated=$(now)
+	write_state
 	trap '' USR1
 	cancel
 	[ -z "$child" ] || kill -KILL "$child" 2>/dev/null
@@ -375,10 +462,12 @@ await_child() {
 query() {
 	local command timeout end
 	command=$1
+	at_failure=unknown-response
 	end=$(( $(now) + query_timeout ))
 	[ "$end" -le "$transaction_end" ] || end=$transaction_end
 	timeout=$((end - $(now)))
-	[ "$timeout" -gt 0 ] && [ "$interrupted" = 0 ] && transaction_valid || return 1
+	[ "$timeout" -gt 0 ] || { at_failure=timeout; return 1; }
+	[ "$interrupted" = 0 ] && transaction_valid || { at_failure=cancelled-or-device-changed; return 1; }
 	{
 		printf 'ABORT "\\r\\nERROR\\r\\n"\nABORT "+CME ERROR:"\nABORT "\\r\\nNO CARRIER\\r\\n"\nABORT "\\r\\nBUSY\\r\\n"\nTIMEOUT %s\n' "$timeout"
 		printf "'' '%s'\n'\\\\r\\\\nOK\\\\r\\\\n' ''\n" "$command"
@@ -389,7 +478,19 @@ query() {
 		exec chat -S -s -V -f "$RUN/query.chat" <"$at" >"$at" 2>"$RUN/response"
 	) &
 	child=$!
-	await_child "$end"
+	await_child "$end" && return 0
+	if [ "$interrupted" = 1 ]; then
+		at_failure=cancelled-or-device-changed
+	elif [ "$(now)" -ge "$end" ]; then
+		at_failure=timeout
+	elif grep -E '(^|[[:space:]])(CME )?ERROR([[:space:]]|$)' "$RUN/response" >/dev/null 2>&1; then
+		at_failure=AT-rejected
+	elif [ ! -c "$at" ]; then
+		at_failure=serial-unavailable
+	else
+		at_failure=no-response-or-unsupported-command
+	fi
+	return 1
 }
 
 registered() {
@@ -447,12 +548,13 @@ undefined_context() {
 
 begin_transaction() {
 	transaction_end=$(( $(now) + transaction_timeout ))
+	set_stage serial-at 'checking configured serial port and AT responsiveness'
 	(
 		exec 9>&- 7>&-
 		exec stty -F "$at" 115200 raw -echo clocal 2>/dev/null
 	) &
 	child=$!
-	await_child "$transaction_end" || return 1
+	await_child "$transaction_end" || { at_failure=serial-unavailable-or-cancelled; return 1; }
 	query AT
 }
 
@@ -514,16 +616,22 @@ health() {
 
 activate() {
 	local cg zg attach
-	activation_stage=initialization
-	begin_transaction && function_ready || return 1
+	activation_stage=radio
+	begin_transaction || return 1
+	set_stage radio-state 'checking modem radio state'
+	function_ready || return 1
 	activation_stage=SIM
+	set_stage SIM 'checking SIM readiness'
 	preinit || return 1
 	activation_stage=registration
+	set_stage registration 'checking network registration'
 	registered || return 1
 	activation_stage=attachment
+	set_stage attachment 'checking packet attachment'
 	attached; attach=$?
 	case "$attach" in 0|1) :;; *) return 1;; esac
 	activation_stage=PDP-validation
+	set_stage PDP-validation 'validating PDP context without exposing APN'
 	active CGACT; cg=$?
 	active ZGACT; zg=$?
 	[ "$interrupted" = 0 ] && transaction_valid || return 1
@@ -544,6 +652,7 @@ activate() {
 		query "AT+CGACT=1,$cid" || return 1
 	fi
 	activation_stage=ZTE-activation
+	set_stage ZTE-activation 'sending required per-connection ZTE activation'
 	# MF832S requires this command for each connection, even with stale active state.
 	query "AT+ZGACT=1,$cid" || return 1
 	# Success here means modem activation, not a DHCP lease.
@@ -554,6 +663,7 @@ retry() {
 	next_try=$(( $(now) + backoff ))
 	backoff=$((backoff * 2))
 	[ "$backoff" -le "$retry_max" ] || backoff=$retry_max
+	write_state
 }
 
 record_failure() {
@@ -594,16 +704,27 @@ recover() {
 }
 
 reconcile() {
-	local previous current activation_rc recover_owned
-	ensure_events || { notice 'Interface event listener unavailable; refusing connection changes'; retry; return; }
+	local previous current activation_rc recover_owned lease_changed previous_health
+	set_stage event-listener 'verifying ubus event listener' quiet
+	ensure_events || {
+		stage_failure event-listener 'listener startup or readiness barrier failed; refusing connection changes'
+		retry
+		return
+	}
 	previous=$generation
+	set_stage usb-discovery 'searching configured VID/PID and USB topology' quiet
 	if ! discover; then
-		notice 'USB discovery failed: require one matching modem, AT port and network device'
+		stage_failure usb-discovery "$discovery_reason; waiting for an unambiguous ready device"
 		network_down
 		generation=
 		return
 	fi
 	generation=$found_generation
+	if [ "$generation" != "$previous" ]; then
+		set_stage usb-associated "confirmed AT port and USB data device; at=$at net=$net"
+	else
+		set_stage usb-associated "confirmed AT port and USB data device; at=$at net=$net" quiet
+	fi
 	if [ "$generation" != "$previous" ]; then
 		network_down || { retry; return; }
 		next_try=0
@@ -612,28 +733,65 @@ reconcile() {
 		health_bad=0
 		recover_bad=0
 	fi
-	network_config "$net" && network_status "$net" || {
-		notice 'Target rejected: enabled service, DHCP binding and USB network status must match'
+	set_stage DHCP-interface-validation 'checking the configured logical DHCP interface and USB binding' quiet
+	network_config "$net" || {
+		stage_failure DHCP-interface-validation "$validation_reason; configured target must be an existing DHCP section bound to $net"
 		network_down
 		return
 	}
+	network_status "$net" || {
+		stage_failure DHCP-interface-validation "$validation_reason; refusing to alter target"
+		network_down
+		return
+	}
+	diagnostic=
+	lease_changed=0
+	if [ "$has_ipv4" != "$observed_ipv4" ]; then
+		lease_changed=1
+		observed_ipv4=$has_ipv4
+	fi
 	current=$(now)
-	[ "$current" -ge "$next_try" ] || return
+	if [ "$current" -lt "$next_try" ]; then
+		set_stage backoff "retry scheduled after bounded backoff at $next_try" quiet
+		write_state
+		return
+	fi
 	# A down edge invalidates ownership even if a rapid restart is already up.
 	if [ -n "$owned_device" ] && {
 		[ "$(interface_event)" != "$owned_event" ] ||
 		{ [ "$owned_online" = 1 ] && [ "$up" = false ]; }
 	}; then
 		network_down || { retry; return; }
-		event_barrier || { retry; return; }
+		event_barrier || {
+			stage_failure event-listener 'event barrier failed after interface teardown; refusing activation'
+			retry
+			return
+		}
 		retry
-		log 'Target connection ended; next attempt requires AT activation'
+		set_stage retry 'target connection ended; next attempt requires AT activation'
 		return
 	fi
-	# A DHCP lease is not proof that the modem's PDP context is still active.
 	if [ "$up" = true ]; then
+		if [ "$has_ipv4" != true ]; then
+			state_health=waiting-for-ipv4
+			set_stage DHCP-lease-waiting 'netifd reports up but no IPv4 lease; waiting within DHCP timeout' quiet
+			if [ -n "$owned_device" ] && [ "$lease_deadline" -gt 0 ] &&
+				[ "$current" -ge "$lease_deadline" ]; then
+				network_down || { retry; return; }
+				stage_failure DHCP-timeout 'no IPv4 lease before the configured DHCP deadline; backing off'
+				retry
+			fi
+			write_state
+			return
+		fi
 		lease_deadline=0
+		has_ipv4=true
+		[ "$lease_changed" = 1 ] && log 'netifd IPv4 lease acquired; public reachability is not implied'
+		previous_health=$state_health
+		state_health=checking
 		[ -z "$owned_device" ] || owned_online=1
+		set_stage online 'IPv4 lease present; this does not imply public Internet reachability' quiet
+		write_state
 		[ "$current" -ge "$health_next" ] || return
 		transaction_active=1
 		transaction_mode=health
@@ -646,10 +804,17 @@ reconcile() {
 			diagnostic=
 			health_bad=0
 			recover_bad=0
+			state_health=healthy
 			backoff=$retry_initial
+			case "$previous_health" in degraded:*|waiting-for-ipv4)
+				log 'AT health check recovered; IPv4 lease remains present'
+				;;
+			esac
 		else
 			record_failure
 			health_bad=$((health_bad + 1))
+			state_health="degraded:$at_failure"
+			stage_failure health-failure "AT health check failed ($at_failure); failure $health_bad/$health_failures"
 			if [ "$health_bad" -ge "$health_failures" ]; then
 				# An interface that we did not start must never be cycled.
 				recover_owned=0
@@ -663,41 +828,65 @@ reconcile() {
 				fi
 				retry
 				health_bad=0
-				log 'Repeated modem health failures; backing off'
+				stage_failure recovery 'repeated health failures; owned interface recovery is rate-limited'
 			fi
 		fi
+		write_state
 		return
 	fi
+	has_ipv4=false
+	write_state
 	if [ "$pending" = true ]; then
 		if [ "$owned_device" = "$net" ] && [ "$owned_usb" = "$usb" ] &&
 			[ "$owned_generation" = "$generation" ] && same_generation; then
 			[ "$current" -ge "$lease_deadline" ] || return
 			network_down || { retry; return; }
 			retry
-			log 'DHCP attempt timed out; backing off'
+			stage_failure DHCP-timeout 'DHCP completed without an IPv4 lease before deadline; backing off'
 			return
 		fi
 		# enabled=1 delegates only this validated target's pending DHCP to us.
 		same_generation && network_config "$net" && network_status "$net" &&
 			[ "$up" = false ] && [ "$pending" = true ] || return
-		coordinate_pending || { retry; return; }
-		log 'Coordinating target pending DHCP before AT activation'
+		set_stage pending-coordination 'coordinating existing target DHCP pending before fresh AT activation'
+		coordinate_pending || {
+			stage_failure pending-coordination 'netifd pending teardown failed or state changed; refusing AT activation'
+			retry
+			return
+		}
 		# Drain our own synchronous netifd down event before opening a new attempt.
-		event_barrier || { retry; return; }
+		event_barrier || {
+			stage_failure event-listener 'event barrier failed after pending teardown; refusing AT activation'
+			retry
+			return
+		}
 		same_generation && network_config "$net" && network_status "$net" &&
-			[ "$up" = false ] && [ "$pending" = false ] || { retry; return; }
+			[ "$up" = false ] && [ "$pending" = false ] || {
+			stage_failure pending-coordination 'pending DHCP state did not clear; refusing AT activation'
+			retry
+			return
+		}
 	fi
-	[ "$available" = true ] || { notice 'Target unavailable; waiting for netifd device readiness'; return; }
+	[ "$available" = true ] || {
+		stage_failure DHCP-interface-validation 'target netifd device is not available yet; waiting for device readiness'
+		return
+	}
 	if [ -n "$owned_device" ] && [ "$lease_deadline" -gt "$current" ]; then
+		set_stage DHCP-lease-waiting 'waiting for target IPv4 lease within configured timeout' quiet
 		return
 	fi
 	if [ -n "$owned_device" ]; then
 		network_down
 		retry
-		log 'DHCP lease failed; backing off'
+		stage_failure DHCP-timeout 'DHCP did not produce an IPv4 lease; backing off'
 		return
 	fi
-	event_barrier || { retry; return; }
+	event_barrier || {
+		stage_failure event-listener 'event barrier failed before activation; refusing connection changes'
+		retry
+		return
+	}
+	set_stage serial-at 'starting the serialized AT activation transaction'
 	transaction_active=1
 	transaction_mode=activate
 	attempt_event=$(interface_event)
@@ -708,12 +897,22 @@ reconcile() {
 		record_failure
 		recover
 		retry
-		[ "$interrupted" = 1 ] || log "AT activation failed at $activation_stage; backing off"
+		if [ "$interrupted" != 1 ]; then
+			stage_failure AT-failure "activation failed at ${activation_stage:-serial-AT} ($at_failure); retry scheduled at $next_try"
+		fi
 		return
 	fi
 	recover_bad=0
-	event_barrier && transaction_valid || { retry; return; }
-	[ "$available" = true ] && [ "$pending" != true ] && [ "$up" != true ] || return
+	set_stage DHCP-start 'AT activation completed; verifying event fence before netifd DHCP'
+	event_barrier && transaction_valid || {
+		stage_failure event-listener 'event barrier or state validation failed after AT activation; DHCP not started'
+		retry
+		return
+	}
+	[ "$available" = true ] && [ "$pending" != true ] && [ "$up" != true ] || {
+		stage_failure DHCP-start 'target changed after AT activation; waiting safely before DHCP start'
+		return
+	}
 	if ubus -t 2 call "network.interface.$interface" up >/dev/null 2>&1; then
 		owned_device=$net
 		owned_usb=$usb
@@ -724,26 +923,72 @@ reconcile() {
 		health_next=$(( $(now) + health_interval ))
 		health_bad=0
 		diagnostic=
-		log 'AT activation completed; target netifd DHCP started'
+		state_health=waiting-for-ipv4
+		has_ipv4=false
+		lease_deadline=$(( $(now) + dhcp_timeout ))
+		set_stage DHCP-lease-waiting "AT activation completed; netifd DHCP started, waiting up to ${dhcp_timeout}s for IPv4"
 	else
-		log 'Target netifd DHCP start failed; backing off'
 		retry
+		stage_failure DHCP-start-failure 'netifd rejected target DHCP start; backing off'
 	fi
 }
 
-load_config || { log 'Disabled or invalid configuration (explicit AT selection required)'; exit 1; }
+log 'Starting MF832S monitor build=1.0.0-r3'
+if ! mkdir -p "$RUN"; then
+	log 'Startup failed: cannot create runtime directory /var/run/mf832s'
+	exit 1
+fi
+chmod 700 "$RUN" 2>/dev/null || {
+	log 'Startup failed: cannot secure runtime directory /var/run/mf832s'
+	exit 1
+}
+if ! load_config; then
+	log "Startup failed: invalid or disabled configuration ($config_error)"
+	state_service=failed
+	monitor_pid=
+	set_stage startup-failure "invalid or disabled configuration ($config_error)"
+	write_state
+	exit 1
+fi
+log "Configuration accepted: target interface=$interface; explicit AT selection present"
+if [ "$interface" != mf832s ]; then
+	log "Configured target differs from default mf832s interface; managing configured target $interface"
+fi
 for tool in chat stty ubus jsonfilter flock mkfifo mktemp; do
-	command -v "$tool" >/dev/null 2>&1 || { log "Required tool missing: $tool"; exit 1; }
+	command -v "$tool" >/dev/null 2>&1 || {
+		log "Startup failed: required tool missing ($tool)"
+		state_service=failed
+		monitor_pid=
+		set_stage startup-failure "required dependency missing: $tool"
+		write_state
+		exit 1
+	}
 done
 # The kernel releases this persistent inode's lock even on a monitor crash.
-exec 9>"$LOCK" || exit 1
-flock -n 9 || exit 0
-rm -rf "$RUN"
-mkdir "$RUN" || exit 1
+exec 9>"$LOCK" || {
+	log 'Startup failed: cannot open single-instance lock'
+	exit 1
+}
+flock -n 9 || {
+	log 'Startup refused: another MF832S monitor holds the instance lock'
+	exit 1
+}
 # An orphan from a crashed instance must never write into a replacement's state.
-RUN=$(mktemp -d "$RUN/instance.XXXXXX") || exit 1
+RUN=$(mktemp -d "$RUN/instance.XXXXXX") || {
+	log 'Startup failed: cannot create private instance runtime directory'
+	state_service=failed
+	monitor_pid=
+	set_stage startup-failure 'private runtime directory creation failed'
+	write_state
+	exit 1
+}
 printf '%s\n' "$$" >"$RUN/pid"
 monitor_pid=$$
+state_service=running
+stage_started=$(now)
+stage_updated=$stage_started
+stage_reason='monitor initialized; discovering modem'
+write_state
 trap 'cleanup; exit 0' TERM INT
 trap wake USR1
 while :; do
