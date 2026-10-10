@@ -19,8 +19,21 @@ health_next=0
 health_bad=0
 recover_bad=0
 recover_next=0
+owned_online=0
+owned_event=
+attempt_event=
+transaction_mode=
+diagnostic=
+event_reader=
+event_listener=
+event_epoch=0
+fence=0
 
 log() { logger -t mf832s "$*"; }
+notice() {
+	[ "$diagnostic" = "$1" ] || log "$1"
+	diagnostic=$1
+}
 now() { date +%s; }
 cancel() {
 	interrupted=1
@@ -30,7 +43,7 @@ cancel() {
 wake() {
 	if [ "$transaction_active" = 1 ]; then
 		# Duplicate/unrelated events must not starve a valid modem transaction.
-		same_generation && return
+		transaction_valid && return
 		cancel
 	elif [ -n "$child" ]; then
 		cancel
@@ -183,7 +196,11 @@ discover() {
 }
 
 network_config() {
-	local proto device section_type
+	local proto device section_type managed selected
+	config_load mf832s
+	config_get_bool managed main enabled 0
+	config_get selected main interface mf832s
+	[ "$managed" = 1 ] && [ "$selected" = "$interface" ] || return 1
 	config_load network
 	config_get section_type "$interface" TYPE
 	config_get proto "$interface" proto
@@ -218,7 +235,7 @@ network_down() {
 			ubus -t 2 call "network.interface.$interface" down >/dev/null 2>&1 || return 1
 		fi
 	fi
-	owned_device='' owned_usb='' owned_generation='' lease_deadline=0
+	owned_device='' owned_usb='' owned_generation='' lease_deadline=0 owned_online=0 owned_event=''
 }
 
 cleanup() {
@@ -226,6 +243,7 @@ cleanup() {
 	cancel
 	[ -z "$child" ] || kill -KILL "$child" 2>/dev/null
 	[ -z "$child" ] || wait "$child" 2>/dev/null
+	stop_events
 	network_down
 	# The persistent lock is outside this private directory and is never unlinked.
 	rm -rf "$RUN"
@@ -237,11 +255,84 @@ same_generation() {
 	[ "$(usb_parent "/sys/class/net/$net/device")" = "$usb" ]
 }
 
+interface_event() {
+	printf '%s:%s\n' "$event_epoch" "$(cat "$RUN/iface-sequence" 2>/dev/null)"
+}
+
+read_events() {
+	local line target action sequence token
+	sequence=0
+	while IFS= read -r line; do
+		target=$(jsonfilter -s "$line" -e '@["network.interface"].interface' 2>/dev/null)
+		action=$(jsonfilter -s "$line" -e '@["network.interface"].action' 2>/dev/null)
+		if [ "$target" = "$interface" ] && [ "$action" = ifdown ]; then
+			sequence=$((sequence + 1))
+			printf '%s\n' "$sequence" >"$RUN/iface-sequence.new"
+			mv "$RUN/iface-sequence.new" "$RUN/iface-sequence"
+			kill -USR1 "$monitor_pid" 2>/dev/null
+		fi
+		token=$(jsonfilter -s "$line" -e '@["mf832s.fence"].token' 2>/dev/null)
+		case "$token" in ''|*[!0-9]*) continue;; esac
+		printf '%s\n' "$token" >"$RUN/fence"
+	done
+}
+
+stop_events() {
+	[ -z "$event_listener" ] || kill "$event_listener" 2>/dev/null
+	[ -z "$event_reader" ] || kill "$event_reader" 2>/dev/null
+	[ -z "$event_listener" ] || wait "$event_listener" 2>/dev/null
+	[ -z "$event_reader" ] || wait "$event_reader" 2>/dev/null
+	event_listener='' event_reader=''
+}
+
+event_barrier() {
+	local end
+	fence=$((fence + 1))
+	end=$(( $(now) + 5 ))
+	while [ "$(now)" -lt "$end" ]; do
+		kill -0 "$event_listener" 2>/dev/null &&
+			kill -0 "$event_reader" 2>/dev/null || return 1
+		ubus -t 1 send mf832s.fence "{\"token\":$fence}" >/dev/null 2>&1 || return 1
+		[ "$(cat "$RUN/fence" 2>/dev/null)" = "$fence" ] && return 0
+		sleep 1
+	done
+	return 1
+}
+
+ensure_events() {
+	if [ -n "$event_listener" ] && [ -n "$event_reader" ] &&
+		kill -0 "$event_listener" 2>/dev/null && kill -0 "$event_reader" 2>/dev/null; then
+		return 0
+	fi
+	stop_events
+	event_epoch=$((event_epoch + 1))
+	rm -f "$RUN/events" "$RUN/fence"
+	mkfifo "$RUN/events" || return 1
+	printf '0\n' >"$RUN/iface-sequence"
+	( exec 9>&-; read_events <"$RUN/events" ) &
+	event_reader=$!
+	( exec 9>&-; exec ubus -S listen network.interface mf832s.fence >"$RUN/events" 2>/dev/null ) &
+	event_listener=$!
+	event_barrier
+}
+
+transaction_valid() {
+	kill -0 "$event_listener" 2>/dev/null &&
+		kill -0 "$event_reader" 2>/dev/null || return 1
+	same_generation && network_config "$net" && network_status "$net" || return 1
+	[ "$(interface_event)" = "$attempt_event" ] || return 1
+	case "$transaction_mode" in
+		activate|recover) [ "$up" = false ] && [ "$pending" = false ];;
+		health) [ "$up" = true ];;
+		*) return 1;;
+	esac
+}
+
 await_child() {
 	local end rc
 	end=$1
 	while kill -0 "$child" 2>/dev/null; do
-		if [ "$interrupted" = 1 ] || [ "$(now)" -ge "$end" ] || ! same_generation; then
+		if [ "$interrupted" = 1 ] || [ "$(now)" -ge "$end" ] || ! transaction_valid; then
 			kill -KILL "$child" 2>/dev/null
 			wait "$child" 2>/dev/null
 			child=
@@ -252,7 +343,7 @@ await_child() {
 	wait "$child"
 	rc=$?
 	child=
-	[ "$rc" = 0 ] && [ "$interrupted" = 0 ] && same_generation
+	[ "$rc" = 0 ] && [ "$interrupted" = 0 ] && transaction_valid
 }
 
 query() {
@@ -261,7 +352,7 @@ query() {
 	end=$(( $(now) + query_timeout ))
 	[ "$end" -le "$transaction_end" ] || end=$transaction_end
 	timeout=$((end - $(now)))
-	[ "$timeout" -gt 0 ] && [ "$interrupted" = 0 ] && same_generation || return 1
+	[ "$timeout" -gt 0 ] && [ "$interrupted" = 0 ] && transaction_valid || return 1
 	{
 		printf 'ABORT "\\r\\nERROR\\r\\n"\nABORT "+CME ERROR:"\nABORT "\\r\\nNO CARRIER\\r\\n"\nABORT "\\r\\nBUSY\\r\\n"\nTIMEOUT %s\n' "$timeout"
 		printf "'' '%s'\n'\\\\r\\\\nOK\\\\r\\\\n' ''\n" "$command"
@@ -397,12 +488,19 @@ health() {
 
 activate() {
 	local cg zg attach
-	begin_transaction && function_ready && preinit && registered || return 1
+	activation_stage=initialization
+	begin_transaction && function_ready || return 1
+	activation_stage=SIM
+	preinit || return 1
+	activation_stage=registration
+	registered || return 1
+	activation_stage=attachment
 	attached; attach=$?
 	case "$attach" in 0|1) :;; *) return 1;; esac
+	activation_stage=PDP-validation
 	active CGACT; cg=$?
 	active ZGACT; zg=$?
-	[ "$interrupted" = 0 ] && same_generation || return 1
+	[ "$interrupted" = 0 ] && transaction_valid || return 1
 	# A successfully omitted CID may be new, but only definitions can confirm that.
 	if [ "$cg" = 3 ] && [ "$zg" != 0 ]; then
 		undefined_context || return 1
@@ -419,9 +517,9 @@ activate() {
 	if [ "$cg" != 0 ] && [ "$zg" != 0 ]; then
 		query "AT+CGACT=1,$cid" || return 1
 	fi
-	if [ "$zg" != 0 ]; then
-		query "AT+ZGACT=1,$cid" || return 1
-	fi
+	activation_stage=ZTE-activation
+	# MF832S requires this command for each connection, even with stale active state.
+	query "AT+ZGACT=1,$cid" || return 1
 	# Success here means modem activation, not a DHCP lease.
 	return 0
 }
@@ -447,11 +545,13 @@ recover() {
 	local rc
 	[ "$recover_mode" = cfun_cycle ] &&
 	[ "$recover_bad" -ge "$recover_threshold" ] &&
-	[ "$(now)" -ge "$recover_next" ] && recovery_ready || return
+	[ "$(now)" -ge "$recover_next" ] && event_barrier && recovery_ready || return
 	# Rate-limit attempts too, including failed or interrupted cycles.
 	recover_next=$(( $(now) + recover_cooldown ))
 	recover_bad=0
 	transaction_active=1
+	transaction_mode=recover
+	attempt_event=$(interface_event)
 	rc=1
 	if begin_transaction && recovery_ready && query 'AT+CFUN=0'; then
 		(
@@ -469,8 +569,10 @@ recover() {
 
 reconcile() {
 	local previous current activation_rc recover_owned
+	ensure_events || { notice 'Interface event listener unavailable; refusing connection changes'; retry; return; }
 	previous=$generation
 	if ! discover; then
+		notice 'USB discovery failed: require one matching modem, AT port and network device'
 		network_down
 		generation=
 		return
@@ -485,21 +587,37 @@ reconcile() {
 		recover_bad=0
 	fi
 	network_config "$net" && network_status "$net" || {
+		notice 'Target rejected: enabled service, DHCP binding and USB network status must match'
 		network_down
 		return
 	}
 	current=$(now)
 	[ "$current" -ge "$next_try" ] || return
+	# A down edge invalidates ownership even if a rapid restart is already up.
+	if [ -n "$owned_device" ] && {
+		[ "$(interface_event)" != "$owned_event" ] ||
+		{ [ "$owned_online" = 1 ] && [ "$up" = false ]; }
+	}; then
+		network_down || { retry; return; }
+		event_barrier || { retry; return; }
+		retry
+		log 'Target connection ended; next attempt requires AT activation'
+		return
+	fi
 	# A DHCP lease is not proof that the modem's PDP context is still active.
 	if [ "$up" = true ]; then
 		lease_deadline=0
+		[ -z "$owned_device" ] || owned_online=1
 		[ "$current" -ge "$health_next" ] || return
 		transaction_active=1
+		transaction_mode=health
+		attempt_event=$(interface_event)
 		health
 		activation_rc=$?
 		transaction_active=0
 		health_next=$(( $(now) + health_interval ))
 		if [ "$activation_rc" = 0 ]; then
+			diagnostic=
 			health_bad=0
 			recover_bad=0
 			backoff=$retry_initial
@@ -525,19 +643,26 @@ reconcile() {
 		return
 	fi
 	if [ "$pending" = true ]; then
-		[ "$owned_device" = "$net" ] && [ "$owned_usb" = "$usb" ] &&
-		[ "$owned_generation" = "$generation" ] && same_generation || return
-		# netifd may restart DHCP after carrier loss without a monitor up request.
-		if [ "$lease_deadline" = 0 ]; then
-			lease_deadline=$((current + dhcp_timeout))
+		if [ "$owned_device" = "$net" ] && [ "$owned_usb" = "$usb" ] &&
+			[ "$owned_generation" = "$generation" ] && same_generation; then
+			[ "$current" -ge "$lease_deadline" ] || return
+			network_down || { retry; return; }
+			retry
+			log 'DHCP attempt timed out; backing off'
+			return
 		fi
-		[ "$current" -ge "$lease_deadline" ] || return
-		network_down
-		retry
-		log 'DHCP attempt timed out; backing off'
-		return
+		# enabled=1 delegates only this validated target's pending DHCP to us.
+		same_generation && network_config "$net" && network_status "$net" &&
+			[ "$up" = false ] && [ "$pending" = true ] || return
+		log 'Coordinating target pending DHCP before AT activation'
+		owned_device=$net owned_usb=$usb owned_generation=$generation
+		network_down || { retry; return; }
+		# Drain our own synchronous netifd down event before opening a new attempt.
+		event_barrier || { retry; return; }
+		same_generation && network_config "$net" && network_status "$net" &&
+			[ "$up" = false ] && [ "$pending" = false ] || { retry; return; }
 	fi
-	[ "$available" = true ] || return
+	[ "$available" = true ] || { notice 'Target unavailable; waiting for netifd device readiness'; return; }
 	if [ -n "$owned_device" ] && [ "$lease_deadline" -gt "$current" ]; then
 		return
 	fi
@@ -547,7 +672,10 @@ reconcile() {
 		log 'DHCP lease failed; backing off'
 		return
 	fi
+	event_barrier || { retry; return; }
 	transaction_active=1
+	transaction_mode=activate
+	attempt_event=$(interface_event)
 	activate
 	activation_rc=$?
 	transaction_active=0
@@ -555,21 +683,25 @@ reconcile() {
 		record_failure
 		recover
 		retry
-		[ "$interrupted" = 1 ] || log 'Registration or activation incomplete; backing off'
+		[ "$interrupted" = 1 ] || log "AT activation failed at $activation_stage; backing off"
 		return
 	fi
 	recover_bad=0
-	same_generation && network_config "$net" && network_status "$net" || { retry; return; }
+	event_barrier && transaction_valid || { retry; return; }
 	[ "$available" = true ] && [ "$pending" != true ] && [ "$up" != true ] || return
 	if ubus -t 2 call "network.interface.$interface" up >/dev/null 2>&1; then
 		owned_device=$net
 		owned_usb=$usb
 		owned_generation=$generation
+		owned_event=$attempt_event
+		owned_online=0
 		lease_deadline=$(( $(now) + dhcp_timeout ))
 		health_next=$(( $(now) + health_interval ))
 		health_bad=0
-		log 'PDP activated; waiting for netifd DHCP'
+		diagnostic=
+		log 'AT activation completed; target netifd DHCP started'
 	else
+		log 'Target netifd DHCP start failed; backing off'
 		retry
 	fi
 }
@@ -584,6 +716,7 @@ flock -n 9 || exit 0
 rm -rf "$RUN"
 mkdir "$RUN" || exit 1
 printf '%s\n' "$$" >"$RUN/pid"
+monitor_pid=$$
 trap 'cleanup; exit 0' TERM INT
 trap wake USR1
 while :; do
