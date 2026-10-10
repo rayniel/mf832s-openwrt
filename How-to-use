@@ -132,33 +132,57 @@ readlink -f /sys/class/tty/ttyACM*/device
 ls /sys/bus/usb/devices/
 ```
 
-## Important behavior
+## 重要行为
 
-- `enabled=1` means the service is allowed to manage the target connection.
-- `auto=0` is still recommended so the service can control the activation sequence.
-- The package does not guess your AT port or APN.
-- The package does not modify firewall zones or global network settings.
-- A DHCP lease means the interface is up, but it does not automatically mean internet access is available.
-- AT activation success does not automatically mean DHCP has succeeded yet.
+- `enabled=1` 表示服务允许管理这个目标连接。
+- 仍然推荐 `auto=0`，这样服务才能控制 AT 初始化、激活和 DHCP 的顺序。
+- 本包不会猜你的 AT 口或 APN。
+- 本包不会修改防火墙区或全局网络设置。
+- 拿到 DHCP 租约只表示接口已经起来了，不代表一定能上网。
+- AT 激活成功，也不等于 DHCP 一定成功。
 
-## Troubleshooting
+## 使用示例：4G 接口绑定 eth1
 
-If you created an interface such as `4G` and bound it to `eth1`, but DHCP still does not get an address:
+如果你创建了一个逻辑接口 `4G`，并把它绑定到 `eth1`，配置可以是：
 
-1. Confirm `mf832s.main.interface` matches your network section name.
-2. Confirm `network.4G.proto` is `dhcp`.
-3. Confirm `network.4G.device` is the correct modem-owned USB Ethernet device.
-4. Confirm the AT port is explicitly selected.
-5. Confirm the APN is correct for your carrier.
-6. Check `logread -e mf832s` for the exact stage where it stopped.
-7. Check `ubus call network.interface.4G status` to see whether netifd is pending, up, or unavailable.
+```sh
+uci set network.4G='interface'
+uci set network.4G.proto='dhcp'
+uci set network.4G.device='eth1'
+uci set network.4G.auto='0'
+uci set mf832s.main.interface='4G'
+uci set mf832s.main.enabled='1'
+uci commit network
+uci commit mf832s
+/etc/init.d/mf832s enable
+/etc/init.d/mf832s start
+```
 
-If the interface is restarted, the service should re-run the activation flow. If it does not, the logs and status output are the first place to look.
+注意：
 
-## Development notes
+- `4G` 只是名字，可以换成 `wan4g`、`lte0` 或其他你喜欢的名字。
+- 真正决定联动的是 `device='eth1'` 是否确实属于这台 MF832S。
+- 只有当这个 `eth1` 确实是目标 USB 网卡时，服务才会接管。
+- 如果接口重启，服务会重新执行 AT 初始化与激活流程，再让 DHCP 继续。
 
-This repository uses shell scripts and a small package Makefile. It is intended to be built with the OpenWrt SDK.
+## 故障排查
 
-## License
+如果你创建了 `4G`，绑定了 `eth1`，但 DHCP 还是拿不到地址：
+
+1. 确认 `mf832s.main.interface` 和你的网络接口名一致。
+2. 确认 `network.4G.proto` 是 `dhcp`。
+3. 确认 `network.4G.device` 真的是这个卡托对应的 USB 网卡。
+4. 确认 AT 口已经明确设置。
+5. 确认 APN 是你运营商的正确值。
+6. 查看 `logread -e mf832s`，确认卡在哪个阶段。
+7. 查看 `ubus call network.interface.4G status`，确认是 pending、up 还是 unavailable。
+
+如果接口重启后服务没有重新走激活流程，优先看日志和状态输出。
+
+## 开发说明
+
+本仓库主要由 shell 脚本和一个小型 package Makefile 组成，适合通过 OpenWrt SDK 构建。
+
+## 许可证
 
 GPL-3.0-only
