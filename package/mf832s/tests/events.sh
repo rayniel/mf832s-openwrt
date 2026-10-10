@@ -25,7 +25,7 @@ esac
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
 TMP=$(mktemp -d)
-sed '/^\. \/lib\/functions.sh$/d; /^load_config ||/,$d' \
+sed '/^\. \/lib\/functions.sh$/d; /^log .Starting MF832S monitor build=/,$d' \
 	"$ROOT/package/mf832s/files/mf832s-monitor" >"$TMP/functions"
 . "$TMP/functions"
 RUN=$TMP/run

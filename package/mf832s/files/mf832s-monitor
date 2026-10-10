@@ -26,8 +26,10 @@ attempt_event=
 transaction_mode=
 diagnostic=
 config_error=
+target_device=
 discovery_reason=
 validation_reason=
+at_failure=unknown-response
 stage=starting
 stage_reason='monitor starting'
 stage_started=0
@@ -57,6 +59,7 @@ write_state() {
 		printf 'instance=%s\n' "${RUN:-}"
 		printf 'target=%s\n' "${interface:-}"
 		printf 'configured_net=%s\n' "${net_device:-}"
+		printf 'target_device=%s\n' "${target_device:-}"
 		printf 'usb=%s\n' "${usb:-}"
 		printf 'at=%s\n' "${at:-}"
 		printf 'net=%s\n' "${net:-}"
@@ -123,6 +126,7 @@ number() {
 }
 
 load_config() {
+	config_error=
 	config_load mf832s
 	config_get_bool enabled main enabled 0
 	[ "$enabled" = 1 ] || { config_error=disabled; return 1; }
@@ -154,17 +158,17 @@ load_config() {
 	[ "${#apn}" -le 100 ] || { config_error=invalid-apn-length; return 1; }
 	case "$pdp_type" in IP|IPV6|IPV4V6) :;; *) config_error=invalid-pdp-type; return 1;; esac
 	case "$recover_mode" in none|cfun_cycle) :;; *) config_error=invalid-recovery-mode; return 1;; esac
-	number cid "$cid" 1 16 &&
-	number query_timeout "$query_timeout" 1 30 &&
-	number transaction_timeout "$transaction_timeout" 5 300 &&
-	number poll_interval "$poll_interval" 1 300 &&
-	number retry_initial "$retry_initial" 1 300 &&
-	number retry_max "$retry_max" "$retry_initial" 3600 &&
-	number dhcp_timeout "$dhcp_timeout" 5 600 &&
-	number health_interval "$health_interval" 5 600 &&
-	number health_failures "$health_failures" 1 10 &&
-	number recover_threshold "$recover_threshold" 1 100 &&
-	number recover_cooldown "$recover_cooldown" 0 86400 || { config_error=invalid-timing-or-retry-setting; return 1; }
+	number cid "$cid" 1 16 || { config_error=invalid-cid; return 1; }
+	number query_timeout "$query_timeout" 1 30 || { config_error=invalid-query-timeout; return 1; }
+	number transaction_timeout "$transaction_timeout" 5 300 || { config_error=invalid-transaction-timeout; return 1; }
+	number poll_interval "$poll_interval" 1 300 || { config_error=invalid-poll-interval; return 1; }
+	number retry_initial "$retry_initial" 1 300 || { config_error=invalid-initial-retry; return 1; }
+	number retry_max "$retry_max" "$retry_initial" 3600 || { config_error=invalid-maximum-retry; return 1; }
+	number dhcp_timeout "$dhcp_timeout" 5 600 || { config_error=invalid-dhcp-timeout; return 1; }
+	number health_interval "$health_interval" 5 600 || { config_error=invalid-health-interval; return 1; }
+	number health_failures "$health_failures" 1 10 || { config_error=invalid-health-failure-limit; return 1; }
+	number recover_threshold "$recover_threshold" 1 100 || { config_error=invalid-recovery-threshold; return 1; }
+	number recover_cooldown "$recover_cooldown" 0 86400 || { config_error=invalid-recovery-cooldown; return 1; }
 	[ "$transaction_timeout" -ge "$query_timeout" ] || { config_error=transaction-timeout-before-query-timeout; return 1; }
 	case "$vid$pid" in *[!0-9a-fA-F]*) config_error=invalid-usb-vid-pid; return 1;; esac
 	[ "${#vid}" = 4 ] && [ "${#pid}" = 4 ] || { config_error=invalid-usb-vid-pid; return 1; }
@@ -271,6 +275,7 @@ network_config() {
 	config_get section_type "$interface" TYPE
 	config_get proto "$interface" proto
 	config_get device "$interface" device
+	target_device=$device
 	[ "$section_type" = interface ] || { validation_reason=target-interface-missing; return 1; }
 	[ "$proto" = dhcp ] || { validation_reason=target-protocol-not-dhcp; return 1; }
 	[ "$device" = "$1" ] || { validation_reason=target-device-not-discovered-usb-net; return 1; }
@@ -462,7 +467,7 @@ await_child() {
 query() {
 	local command timeout end
 	command=$1
-	at_failure=unknown-response
+	at_failure=no-response-or-unsupported-command
 	end=$(( $(now) + query_timeout ))
 	[ "$end" -le "$transaction_end" ] || end=$transaction_end
 	timeout=$((end - $(now)))
@@ -478,7 +483,7 @@ query() {
 		exec chat -S -s -V -f "$RUN/query.chat" <"$at" >"$at" 2>"$RUN/response"
 	) &
 	child=$!
-	await_child "$end" && return 0
+	await_child "$end" && { at_failure=none; return 0; }
 	if [ "$interrupted" = 1 ]; then
 		at_failure=cancelled-or-device-changed
 	elif [ "$(now)" -ge "$end" ]; then
@@ -510,10 +515,12 @@ registered() {
 		fi
 		[ "$interrupted" = 0 ] || return 1
 	done
+	[ "$at_failure" != none ] || at_failure=not-registered-or-unsupported-response
 	return 1
 }
 
 active() {
+	local rc
 	query "AT+$1?" || return 2
 	awk -v prefix="+$1:" -v cid="$cid" '
 		index($0,prefix) {
@@ -528,6 +535,12 @@ active() {
 		}
 		END { exit (found ? 0 : (known ? 1 : (malformed ? 2 : 3))) }
 	' "$RUN/response"
+	rc=$?
+	case "$rc" in
+		2) at_failure=unrecognized-PDP-state;;
+		3) at_failure=PDP-state-not-reported;;
+	esac
+	return "$rc"
 }
 
 undefined_context() {
@@ -543,12 +556,19 @@ undefined_context() {
 				malformed=1
 		}
 		END { exit (defined || malformed) }
-	' "$RUN/response"
+	' "$RUN/response" || {
+		[ "$at_failure" != none ] || at_failure=unrecognized-PDP-context
+		return 1
+	}
 }
 
 begin_transaction() {
 	transaction_end=$(( $(now) + transaction_timeout ))
-	set_stage serial-at 'checking configured serial port and AT responsiveness'
+	if [ "$transaction_mode" = health ]; then
+		set_stage health-check 'performing scheduled modem health check' quiet
+	else
+		set_stage serial-at 'checking configured serial port and AT responsiveness'
+	fi
 	(
 		exec 9>&- 7>&-
 		exec stty -F "$at" 115200 raw -echo clocal 2>/dev/null
@@ -568,7 +588,11 @@ function_ready() {
 			if (line=="0" || line=="1") print line
 		}
 	' "$RUN/response")
-	case "$state" in 1) return 0;; 0) query 'AT+CFUN=1';; *) return 1;; esac
+	case "$state" in
+		1) return 0;;
+		0) query 'AT+CFUN=1';;
+		*) at_failure=unrecognized-radio-state; return 1;;
+	esac
 }
 
 preinit() {
@@ -582,7 +606,10 @@ preinit() {
 			else not_ready=1
 		}
 		END { exit (!ready || not_ready) }
-	' "$RUN/response" || return 1
+	' "$RUN/response" || {
+		[ "$at_failure" != none ] || at_failure=SIM-not-ready-or-unrecognized-response
+		return 1
+	}
 	# Keep diagnostics private, just like other AT responses.
 	query 'AT+CSQ' || :
 	[ "$interrupted" = 0 ] && same_generation
@@ -605,35 +632,46 @@ attached() {
 }
 
 health() {
-	local cg zg
+	local cg zg cg_failure zg_failure
 	begin_transaction && registered || return 1
 	active CGACT; cg=$?
+	cg_failure=$at_failure
 	active ZGACT; zg=$?
+	zg_failure=$at_failure
+	if [ "$cg_failure" != none ] && [ "$zg_failure" = none ]; then
+		at_failure=$cg_failure
+	fi
 	[ "$interrupted" = 0 ] && same_generation || return 1
 	[ "$cg" != 1 ] && [ "$zg" != 1 ] &&
 		{ [ "$cg" = 0 ] || [ "$zg" = 0 ]; }
 }
 
 activate() {
-	local cg zg attach
-	activation_stage=radio
+	local cg zg attach cg_failure zg_failure
+	activation_stage=serial-AT
 	begin_transaction || return 1
+	activation_stage=radio
 	set_stage radio-state 'checking modem radio state'
-	function_ready || return 1
+	function_ready || { [ "$at_failure" != none ] || at_failure=unrecognized-radio-state; return 1; }
 	activation_stage=SIM
 	set_stage SIM 'checking SIM readiness'
-	preinit || return 1
+	preinit || { [ "$at_failure" != none ] || at_failure=SIM-not-ready-or-unrecognized-response; return 1; }
 	activation_stage=registration
 	set_stage registration 'checking network registration'
 	registered || return 1
 	activation_stage=attachment
 	set_stage attachment 'checking packet attachment'
 	attached; attach=$?
-	case "$attach" in 0|1) :;; *) return 1;; esac
+	case "$attach" in 0|1) :;; *) [ "$at_failure" != none ] || at_failure=unrecognized-attachment-response; return 1;; esac
 	activation_stage=PDP-validation
 	set_stage PDP-validation 'validating PDP context without exposing APN'
 	active CGACT; cg=$?
+	cg_failure=$at_failure
 	active ZGACT; zg=$?
+	zg_failure=$at_failure
+	if [ "$cg_failure" != none ] && [ "$zg_failure" = none ]; then
+		at_failure=$cg_failure
+	fi
 	[ "$interrupted" = 0 ] && transaction_valid || return 1
 	# A successfully omitted CID may be new, but only definitions can confirm that.
 	if [ "$cg" = 3 ] && [ "$zg" != 0 ]; then
@@ -641,7 +679,10 @@ activate() {
 		cg=1
 	fi
 	# Unknown CGACT state is not safe to overwrite; retry without changing the APN.
-	[ "$cg" != 2 ] || [ "$zg" = 0 ] || return 1
+	[ "$cg" != 2 ] || [ "$zg" = 0 ] || {
+		[ "$at_failure" != none ] || at_failure=unrecognized-PDP-state
+		return 1
+	}
 	if [ "$cg" != 0 ] && [ "$zg" != 0 ]; then
 		query "AT+CGDCONT=$cid,\"$pdp_type\",\"$apn\"" || return 1
 	fi
@@ -749,6 +790,9 @@ reconcile() {
 	if [ "$has_ipv4" != "$observed_ipv4" ]; then
 		lease_changed=1
 		observed_ipv4=$has_ipv4
+		if [ "$has_ipv4" != true ]; then
+			log 'netifd IPv4 lease is no longer present; connection is not online'
+		fi
 	fi
 	current=$(now)
 	if [ "$current" -lt "$next_try" ]; then
@@ -774,11 +818,19 @@ reconcile() {
 	if [ "$up" = true ]; then
 		if [ "$has_ipv4" != true ]; then
 			state_health=waiting-for-ipv4
-			set_stage DHCP-lease-waiting 'netifd reports up but no IPv4 lease; waiting within DHCP timeout' quiet
-			if [ -n "$owned_device" ] && [ "$lease_deadline" -gt 0 ] &&
-				[ "$current" -ge "$lease_deadline" ]; then
-				network_down || { retry; return; }
-				stage_failure DHCP-timeout 'no IPv4 lease before the configured DHCP deadline; backing off'
+			if [ "$lease_deadline" -eq 0 ]; then
+				lease_deadline=$(( current + dhcp_timeout ))
+				write_state
+			fi
+			set_stage DHCP-lease-waiting 'netifd reports up but no IPv4 lease; waiting within DHCP timeout'
+			if [ "$current" -ge "$lease_deadline" ]; then
+				if [ -n "$owned_device" ]; then
+					network_down || { retry; return; }
+					stage_failure DHCP-timeout 'no IPv4 lease before the configured DHCP deadline; backing off'
+				else
+					stage_failure DHCP-timeout 'unowned interface is up without IPv4; refusing takeover or teardown'
+					lease_deadline=0
+				fi
 				retry
 			fi
 			write_state
@@ -806,6 +858,7 @@ reconcile() {
 			recover_bad=0
 			state_health=healthy
 			backoff=$retry_initial
+			set_stage online 'IPv4 lease present; latest modem health check succeeded' quiet
 			case "$previous_health" in degraded:*|waiting-for-ipv4)
 				log 'AT health check recovered; IPv4 lease remains present'
 				;;

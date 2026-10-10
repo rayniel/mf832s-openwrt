@@ -25,9 +25,22 @@ while [ "$#" -gt 0 ]; do
 done
 [ "$check" = 0 ] || candidate=${candidate:-$target}
 
+usb_parent_of() {
+	local physical
+	physical=$(readlink -f "$1" 2>/dev/null) || return 1
+	while [ -n "$physical" ] && [ "$physical" != / ]; do
+		if [ -r "$physical/idVendor" ] && [ -r "$physical/idProduct" ]; then
+			printf '%s\n' "$physical"
+			return 0
+		fi
+		physical=${physical%/*}
+	done
+	return 1
+}
+
 service=unknown pid= instance= stage=unknown reason='No monitor state recorded'
 stage_started=0 updated=0 retry_at=0 lease_deadline=0
-configured_net= usb= at= net= has_ipv4=false health=unknown state_service=
+configured_net= target_device= usb= at= net= has_ipv4=false health=unknown state_service=
 if [ -r "$STATUS_FILE" ]; then
 	while IFS='=' read -r key value; do
 		case "$key" in
@@ -36,6 +49,7 @@ if [ -r "$STATUS_FILE" ]; then
 			instance) instance=$value;;
 			target) state_target=$value;;
 			configured_net) configured_net=$value;;
+			target_device) target_device=$value;;
 			usb) usb=$value;;
 			at) at=$value;;
 			net) net=$value;;
@@ -52,10 +66,9 @@ if [ -r "$STATUS_FILE" ]; then
 fi
 
 monitor_alive=0
-case "$pid:$instance" in
-	*[!0-9:/.a-zA-Z_-]*|'':*) :;;
-	*)
-		case "$instance" in /var/run/mf832s/instance.*)
+case "$pid" in ''|*[!0-9]*) ;; *)
+	case "$instance" in
+		/var/run/mf832s/instance.*)
 			if [ "$(dirname "$instance")" = /var/run/mf832s ] &&
 				[ -r "$instance/pid" ] && [ "$(cat "$instance/pid" 2>/dev/null)" = "$pid" ] &&
 				kill -0 "$pid" 2>/dev/null &&
@@ -64,8 +77,8 @@ case "$pid:$instance" in
 				monitor_alive=1
 			fi
 			;;
-		esac
-		;;
+esac
+;;
 esac
 if [ "$enabled" != 1 ]; then
 	service=disabled
@@ -103,6 +116,9 @@ retry_remaining=0
 lease_remaining=0
 case "$retry_at" in *[!0-9]*|'') retry_at=0;; esac
 case "$lease_deadline" in *[!0-9]*|'') lease_deadline=0;; esac
+case "$stage_started" in *[!0-9]*|'') stage_started=0;; esac
+case "$updated" in *[!0-9]*|'') updated=0;; esac
+case "$has_ipv4" in true|false) :;; *) has_ipv4=false;; esac
 [ "$retry_at" -le "$now" ] || retry_remaining=$((retry_at - now))
 [ "$lease_deadline" -le "$now" ] || lease_remaining=$((lease_deadline - now))
 
@@ -148,7 +164,8 @@ fi
 printf 'Service: %s\n' "$service"
 [ -z "$pid" ] || printf 'Monitor PID: %s%s\n' "$pid" "$([ "$monitor_alive" = 1 ] || printf ' (not verified active)')"
 printf 'Configured target: %s (enabled=%s)\n' "$target" "$enabled"
-printf 'DHCP device configured: %s\n' "${configured_net:-unknown}"
+printf 'Network interface device: %s; optional device filter: %s\n' \
+	"${target_device:-unknown}" "${configured_net:-none}"
 printf 'Discovered USB: %s; AT port: %s; data device: %s\n' \
 	"${usb:-unknown}" "${at:-unknown}" "${net:-unknown}"
 printf 'Stage: %s\nReason: %s\n' "$stage" "$reason"
@@ -170,11 +187,17 @@ if [ "$check" = 1 ]; then
 	[ "$section" = interface ] || printf '  ERROR: network.%s interface section does not exist.\n' "$candidate"
 	[ "$proto" = dhcp ] || printf '  ERROR: network.%s protocol is %s, not dhcp.\n' "$candidate" "${proto:-unset}"
 	[ -z "$old_ifname" ] || printf '  WARNING: legacy ifname=%s is present; use the OpenWrt device option instead.\n' "$old_ifname"
-	[ -z "$device" ] || [ "$device" = eth1 ] || :
 	printf '  network.%s device=%s; choose the verified USB data device (eth1 is not assumed).\n' "$candidate" "${device:-unset}"
+	at_interface=$(uci -q get mf832s.main.at_interface 2>/dev/null)
+	at_device=$(uci -q get mf832s.main.at_device 2>/dev/null)
+	vid=$(uci -q get mf832s.main.vid 2>/dev/null)
+	pid_filter=$(uci -q get mf832s.main.pid 2>/dev/null)
+	usb_path_filter=$(uci -q get mf832s.main.usb_path 2>/dev/null)
+	serial_filter=$(uci -q get mf832s.main.serial 2>/dev/null)
+	vid=$(printf '%s' "${vid:-19d2}" | tr A-F a-f)
+	pid_filter=$(printf '%s' "${pid_filter:-0199}" | tr A-F a-f)
 	[ -n "$at_interface$at_device" ] ||
 		printf '  BLOCKED: no explicit AT port selected; configure verified at_interface or at_device, do not guess ttyUSB numbering.\n'
-	if [ -z "$at_interface$at_device" ]; then :; fi
 	if [ -z "$usb" ] && [ "$service" != running ]; then
 		printf '  USB discovery: no active monitor discovery result is available; inspect VID/PID and USB drivers.\n'
 	elif [ -n "$usb" ]; then
@@ -183,18 +206,62 @@ if [ "$check" = 1 ]; then
 			printf '  ERROR: configured network device %s differs from discovered USB data device %s.\n' "$device" "$net"
 		fi
 	fi
-	if [ -n "$candidate" ] && [ -e "/sys/class/net/$device/device" ]; then
-		physical=$(readlink -f "/sys/class/net/$device/device" 2>/dev/null)
-		while [ -n "$physical" ] && [ "$physical" != / ] &&
-			{ [ ! -r "$physical/idVendor" ] || [ ! -r "$physical/idProduct" ]; }; do
-			physical=${physical%/*}
-		done
-		if [ -r "$physical/idVendor" ] && [ -r "$physical/idProduct" ]; then
-			printf '  USB parent for %s: %s (%s:%s)\n' "$device" "${physical##*/}" \
-				"$(cat "$physical/idVendor")" "$(cat "$physical/idProduct")"
-		else
-			printf '  USB parent for %s: not found; verify it belongs to the selected modem.\n' "$device"
+	match_count=0
+	selected_usb=
+	for usb_entry in /sys/bus/usb/devices/*; do
+		[ -r "$usb_entry/idVendor" ] && [ -r "$usb_entry/idProduct" ] || continue
+		[ "$(cat "$usb_entry/idVendor" 2>/dev/null)" = "$vid" ] &&
+			[ "$(cat "$usb_entry/idProduct" 2>/dev/null)" = "$pid_filter" ] || continue
+		[ -z "$usb_path_filter" ] || [ "${usb_entry##*/}" = "$usb_path_filter" ] || continue
+		[ -z "$serial_filter" ] || [ "$(cat "$usb_entry/serial" 2>/dev/null)" = "$serial_filter" ] || continue
+		match_count=$((match_count + 1))
+		selected_usb=$(readlink -f "$usb_entry" 2>/dev/null)
+	done
+	case "$match_count" in
+		0) printf '  USB discovery: no connected device matches configured VID/PID selectors %s:%s.\n' "$vid" "$pid_filter";;
+		1) printf '  USB discovery: one configured VID/PID match is present.\n';;
+		*) printf '  USB discovery: %s matching devices; set a verified usb_path selector to disambiguate.\n' "$match_count";;
+	esac
+	net_parent=$(usb_parent_of "/sys/class/net/$device/device")
+	if [ -n "$net_parent" ]; then
+		printf '  USB parent for %s: %s (%s:%s)\n' "$device" "${net_parent##*/}" \
+			"$(cat "$net_parent/idVendor" 2>/dev/null)" "$(cat "$net_parent/idProduct" 2>/dev/null)"
+		if [ -n "$selected_usb" ] && [ "$net_parent" != "$selected_usb" ]; then
+			printf '  ERROR: %s is not attached to the uniquely selected USB modem.\n' "$device"
+		elif [ "$match_count" = 1 ]; then
+			printf '  OK: %s belongs to the selected USB modem.\n' "$device"
 		fi
+	else
+		printf '  USB parent for %s: unavailable; device may be absent or not a USB network function.\n' "${device:-unset}"
+	fi
+	if [ -n "$selected_usb" ]; then
+		at_count=0
+		for tty_path in /sys/class/tty/ttyUSB* /sys/class/tty/ttyACM*; do
+			[ -e "$tty_path/device" ] || continue
+			at_node=/dev/${tty_path##*/}
+			[ -z "$at_device" ] || [ "$at_node" = "$at_device" ] || continue
+			tty_parent=$(usb_parent_of "$tty_path/device") || continue
+			[ "$tty_parent" = "$selected_usb" ] || continue
+			if [ -n "$at_interface" ]; then
+				walk=$(readlink -f "$tty_path/device" 2>/dev/null)
+				ifnum=
+				while [ -n "$walk" ] && [ "$walk" != "$selected_usb" ]; do
+					if [ -r "$walk/bInterfaceNumber" ]; then
+						ifnum=$(cat "$walk/bInterfaceNumber" 2>/dev/null)
+						break
+					fi
+					walk=${walk%/*}
+				done
+				[ "$ifnum" = "$(printf '%s' "$at_interface" | tr A-F a-f)" ] || continue
+			fi
+			[ -c "$at_node" ] || continue
+			at_count=$((at_count + 1))
+		done
+		case "$at_count" in
+			0) printf '  AT port: no ready serial device matches the explicit selector and selected USB modem.\n';;
+			1) printf '  AT port: one ready serial device matches the explicit selector.\n';;
+			*) printf '  AT port: %s matching serial devices; selector is ambiguous.\n' "$at_count";;
+		esac
 	fi
 	printf '  AT activation and an IPv4 lease are separate stages; lease presence does not prove public reachability.\n'
 fi

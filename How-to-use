@@ -55,6 +55,7 @@ flock 提供崩溃后自动释放的单实例锁，不使用容易遗留的 mkdi
   package/mf832s/files/mf832s.config
   package/mf832s/files/mf832s.init
   package/mf832s/files/mf832s-monitor
+  package/mf832s/files/mf832s-status
   package/mf832s/files/20-mf832s
   package/mf832s/files/20-mf832s-net
   package/mf832s/files/20-mf832s-iface
@@ -154,6 +155,75 @@ APN 仅接受字母、数字、点、下划线、连字符；不允许 AT/chat �
 服务开机启用与配置 enabled 是两回事；enabled=0 时不创建监控实例。
 其他调制解调器管理器不得同时占用所选串口。
 
+### 示例：将 4G 逻辑接口绑定到已确认的 eth1
+
+仅在你已从 `/sys/class/net/eth1/device` 的 USB 父设备确认 `eth1`
+属于这台 MF832S 后使用。下面的 UCI 命令**会修改配置**，不猜 AT 口或 APN；
+`at_interface`、`at_device` 与 `apn` 必须按你自己的固件和实机调查结果填写。
+
+```sh
+# 修改 mf832s 服务目标和已核对的 DHCP 网络接口。
+uci set mf832s.main.interface='4G'
+uci set network.4G='interface'
+uci set network.4G.proto='dhcp'
+uci set network.4G.device='eth1'
+uci set network.4G.auto='0'
+uci set mf832s.main.enabled='1'
+# 仅填写已确认的 AT 口选择和运营商 APN；不要照抄猜测的 ttyUSB 编号。
+# uci set mf832s.main.at_interface='<已核实的 USB bInterfaceNumber>'
+# 或 uci set mf832s.main.at_device='<已核实的 /dev/ttyUSBn 或 /dev/ttyACMn>'
+# uci set mf832s.main.apn='<已核实的运营商 APN>'
+uci commit network
+uci commit mf832s
+
+# 检查目标配置；--check 只读，不会启动网络或访问串口。
+/etc/init.d/mf832s status --check 4G
+mf832s-status --check 4G
+
+# 启用开机启动并启动监控服务。
+/etc/init.d/mf832s enable
+/etc/init.d/mf832s start
+```
+
+`/etc/init.d/mf832s enable` 会修改服务开机启用状态；`start` 会启动服务。
+如果 SSH 是经由 `4G` 建立，重启服务或接口可能断开当前连接，请先确保有 LAN/
+串口等恢复途径。不要通过本例全局 reload network，也不要手动运行 `udhcpc`。
+选择 `eth1` 本身不会启动 AT 激活服务。`enabled=1`、init 服务已 enable、
+有效且明确的 AT 口选择及正确 APN 都需要分别满足。
+
+```sh
+# 运行日志与持续跟踪
+logread -e mf832s
+logread -f
+
+# 当前服务/阶段状态；JSON 可选
+mf832s-status
+mf832s-status --json
+/etc/init.d/mf832s status
+
+# OpenWrt 对目标接口的独立状态，以及 USB/串口设备关联
+ubus call network.interface.4G status
+readlink -f /sys/class/net/eth1/device
+readlink -f /sys/class/tty/ttyUSB*/device
+readlink -f /sys/class/tty/ttyACM*/device
+ls /sys/bus/usb/devices/
+```
+
+状态中的 `stage` 和原因说明监控卡在哪一步；例如 `usb-discovery` 表示设备/
+驱动/VID/PID 或匹配存在歧义，`usb-associated` 后的 `DHCP-interface-validation`
+表示需核对 4G 的 DHCP 设备绑定，`serial-at`、`SIM`、`registration`、
+`attachment`、`PDP-validation`、`ZTE-activation` 表示 AT 流程进展，
+`DHCP-lease-waiting` 表示已请求 netifd 获取租约，`online` 只表示确实存在 IPv4
+租约，不代表公网可达。`mf832s-status --check 4G` 会检查服务目标与候选接口、
+协议和设备选项；不会自动更改配置或猜测 eth1/AT 口是否属于调制解调器。
+
+`Service: disabled` 表示 UCI 中 `enabled=0`；`not-enabled-at-boot` 表示 init
+服务未 enable；`failed`/`stale` 表示进程启动失败或最近实例已退出，请结合
+`logread -e mf832s` 查明原因。服务正在运行但处于 `AT-failure` 时，尚未请求本
+服务 DHCP；若显示 `DHCP-lease-waiting` 而没有 IPv4，则 AT 已完成但 netifd 尚未
+报告租约。分别对照 `/etc/init.d/mf832s status` 和
+`ubus call network.interface.4G status`，不要把 AT 成功、接口 up 或公网连通混为一谈。
+
 4. 运行、恢复和排障
 ------------------
 服务启动扫描已经插入的设备；USB/net/目标 iface 事件经 procd 唤醒检查，
@@ -205,6 +275,9 @@ BusyBox 配置须提供 mkfifo 与 mktemp，缺少时启动检查明确报错。
   logread -e mf832s
   ubus call service list '{"name":"mf832s"}'
   ubus call network.interface.mf832s status
+  mf832s-status
+  mf832s-status --json
+  mf832s-status --check 4G
   /etc/init.d/mf832s stop
 
 若没有地址，依次检查 USB 驱动、AT 口归属、SIM/APN/注册、netifd DHCP 和防火墙。
@@ -223,9 +296,13 @@ AT 完成/DHCP 启动及 DHCP 超时退避。发现/配置拒绝按原因去重�
 
   sh package/mf832s/tests/state-machine.sh
   busybox ash package/mf832s/tests/state-machine.sh
+  sh package/mf832s/tests/status.sh
+  sh package/mf832s/tests/init.sh
   sh package/mf832s/tests/events.sh
   busybox ash package/mf832s/tests/events.sh
   sh -n package/mf832s/files/mf832s-monitor
+  sh -n package/mf832s/files/mf832s-status
+  sh -n package/mf832s/files/mf832s.init
   sh -n package/mf832s/files/20-mf832s-iface
 
 测试加载生产 Shell 函数，模拟 UCI、netifd、AT 响应和 USB 代次，校验每次服务
@@ -234,6 +311,8 @@ active 状态、DHCP 超时与退避、正常健康检查、安全拒绝、重�
 USB 变化、事务竞态、AT 失败、恢复限频和目标事件过滤。
 events.sh 直接启动生产 FIFO 监听器，用本地命令替身验证事件屏障、
 快速 down/up、监听重启的代次失效、事件子进程回收及监控被强制终止的清理。
+status.sh 检查只读 4G 配置诊断、JSON 转义及无活 PID 时不报告历史 IPv4 在线。
+init.sh 验证 disabled/invalid 启动日志及 procd stdout/stderr 兜底转发。
 模拟测试不替代 SDK 安装验证、真实 ubus/hotplug 时序及硬件 AT/数据面验证。
 
 6. 验收清单（需要 SDK 与实机，不代表已经通过）
