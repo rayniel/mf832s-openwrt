@@ -128,6 +128,19 @@ next_try=0
 discover && select_at || fail 'multiple responsive ports rejected'
 [ "$at" = "$TMP/dev/ttyACM0" ] || fail 'first ordered responsive port not selected'
 rm "$TMP/dev/ttyACM0"
+SUCCESS_PORT=none
+discover || fail 'disappeared-port topology failed'
+select_at && fail 'nonresponsive replacement was accepted'
+[ -z "$auto_at$auto_generation" ] && [ ! -e "$TMP/at-port" ] ||
+	fail 'disappeared-port confirmation survived a failed probe'
+ln -s /dev/null "$TMP/dev/ttyACM0"
+before=$(grep -c '^AT ' "$TRACE")
+discover && select_at && fail 'returned tty name bypassed backoff using stale confirmation'
+[ "$(grep -c '^AT ' "$TRACE")" = "$before" ] || fail 'returned port bypassed backoff'
+next_try=0 SUCCESS_PORT=all
+discover && select_at || fail 'returned tty name was not reprobed'
+[ "$(grep -c '^AT ' "$TRACE")" -gt "$before" ] || fail 'returned port reused stale confirmation'
+rm "$TMP/dev/ttyACM0"
 discover && select_at || fail 'disappeared cached port did not trigger detection'
 [ "$at" = "$TMP/dev/ttyUSB0" ] || fail 'disappeared port was reused'
 printf 'ok - multiple responders select first stable candidate; disappeared port invalidates lock\n'

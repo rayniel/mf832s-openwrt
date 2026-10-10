@@ -614,6 +614,9 @@ select_at() {
 		auto_at=$at auto_generation=$generation
 		return 0
 	fi
+	# Once disappearance is observed, a reused tty name needs fresh confirmation.
+	auto_at='' auto_generation=''
+	rm -f "$cache"
 	[ "$(now)" -ge "$next_try" ] || return 1
 	count=$(printf '%s\n' "$at_candidates" | awk 'NF==2 { n++ } END { print n+0 }')
 	if [ "$count" -eq 0 ] || [ "$count" -gt 8 ]; then
