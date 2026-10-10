@@ -76,6 +76,10 @@ discover() {
 		no-net) discovery_reason=usb-network-device-not-ready; return 1;;
 	esac
 	usb=/usb/modem at=/dev/ttyUSB0 net=usb0
+	if [ -z "$at_interface$at_device" ]; then
+		at=''
+		at_candidates='02 /dev/ttyUSB0'
+	fi
 	found_generation=$physical_generation
 }
 ensure_events() { [ "$events_ok" = 1 ]; }
@@ -167,6 +171,7 @@ reset() {
 	config=mf832s
 	cfg_apn='' cfg_pdp_type=IPV4V6 cfg_cid=1 cfg_vid=19d2 cfg_pid=0199
 	cfg_usb_path='' cfg_serial='' cfg_at_interface=00 cfg_at_device=''
+	at_interface=00 at_device=''
 	cfg_net_device='' cfg_query_timeout=5 cfg_transaction_timeout=45 cfg_poll_interval=10
 	cfg_retry_initial=5 cfg_retry_max=120 cfg_dhcp_timeout=60 cfg_health_interval=30
 	cfg_health_failures=3 cfg_recover_mode=none cfg_recover_threshold=3 cfg_recover_cooldown=120
@@ -308,12 +313,34 @@ cfg_enabled=0
 load_config && fail 'disabled monitor config was accepted'
 [ "$config_error" = disabled ] || fail "disabled config reason: $config_error"
 cfg_enabled=1 cfg_at_interface=''
-load_config && fail 'missing explicit AT selection was accepted'
-[ "$config_error" = at-port-not-explicitly-selected ] || fail "AT selector reason: $config_error"
+load_config || fail 'automatic AT selection was rejected'
+[ -z "$at_interface$at_device$config_error" ] || fail 'automatic AT config was not retained'
 cfg_at_device=/dev/ttyUSB0 cfg_interface='bad/name'
 load_config && fail 'invalid target interface was accepted'
 [ "$config_error" = invalid-target-interface ] || fail "target config reason: $config_error"
-printf 'ok - disabled, missing AT selection and invalid target configs have distinct reasons\n'
+printf 'ok - automatic AT config accepted; disabled and invalid target configs rejected\n'
+
+reset
+cfg_at_interface=''
+load_config || fail 'auto configuration rejected at startup'
+configure_serial() { transaction_valid; }
+fake_up=true fake_ipv4=192.0.2.2 fail_at=AT
+reconcile
+assert_count 'AT' 1
+assert_count 'DOWN modem' 0
+assert_count 'UP modem' 0
+[ "$stage" = at-discovery ] && [ "$next_try" -gt "$clock" ] ||
+	fail 'automatic detection failure did not leave monitor waiting'
+reconcile
+assert_count 'AT' 1
+fail_at=''
+retry_time
+[ "$at" = /dev/ttyUSB0 ] || fail 'automatic retry did not lock port'
+assert_count 'DOWN modem' 0
+assert_count 'UP modem' 0
+assert_count 'AT+CFUN=0' 0
+assert_count 'AT+ZGACT=1,1' 0
+printf 'ok - auto detection retries without crash or disturbing existing online connection\n'
 
 reset
 log() { printf 'LOG %s\n' "$*" >>"$TRACE"; }
