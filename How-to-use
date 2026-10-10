@@ -7,7 +7,19 @@ This package provides a ZTE MF832S control-plane + USB Ethernet data-plane integ
 - 安装后默认允许服务启动。
 - 程序在后台常驻扫描，未检测到对应卡托时保持静默。
 - 一旦检测到匹配的 MF832S USB 设备或相关网络事件，就自动进入 AT 初始化、注册、附着、ZT E 激活和 DHCP 流程。
-- 如果没有匹配设备，不会胡乱重启网络、不触发错误拨号、不猜 AT 口和 APN。
+- 如果没有匹配设备，不会胡乱重启网络、不触发错误拨号、不猜 APN 或网络接口 device。
+
+## 自动 AT 口检测
+
+`at_interface` / `at_device` 可以都留空，服务不会因缺少 AT 口配置退出。发现唯一匹配的 USB modem，并确认现有 DHCP 接口绑定正确后，程序仅尝试属于同一 USB parent 的 `ttyUSB*` / `ttyACM*`。
+
+- 按 USB `bInterfaceNumber` 升序尝试，同编号按设备路径排序；编号未知的端口排最后。编号只决定顺序，不假定 `02`、`03` 或 `04` 必然是 AT 口。多个端口响应时选择第一个得到完整 `OK` 响应的端口。
+- 每个候选只发送基础 `AT`，不发送 `ATE0`、`AT+CPIN?`、激活、附着、CFUN 或逃逸序列。串口使用 115200/raw，关闭回显、硬件流控和关闭端口时的 DTR 挂断（`-hupcl`）。检测本身不会停止 DHCP 或改动数据连接；成功后的正常激活/健康检查仍沿用现有状态机与所有权防护。
+- 最多接受 8 个候选；单口设置和响应各受 `query_timeout` 限制，整轮受 `transaction_timeout` 限制。失败后常驻等待，按 `retry_initial` / `retry_max` 指数退避，热插拔唤醒不会绕过退避。没卡时继续静默等待。
+- 成功结果锁定在内存，并保存到私有权限的 `/var/run/mf832s/at-port`，记录 USB parent、busnum/devnum 枚举代次与端口。监控重启可复用同一代次的结果；设备重新枚举或端口消失后重新检测，路由器重启会清空运行时缓存。
+- 显式配置任意一个选择器时仍优先使用显式配置，不自动回退到其他串口；同时设置两个时必须同时匹配。仍需用户配置正确的现有 DHCP 接口，不写 network UCI、不全局 reload network、不启动额外 udhcpc、不猜 APN。
+
+`logread -e mf832s` 可查看尝试端口、接口编号、失败原因、最终选择及缓存复用。日志不会输出 AT 响应正文或 APN。若端口被其他串口程序占用，请先停止冲突程序；基础 AT 响应确认的是 AT 通信能力，后续设备专用命令仍由正常状态机验证。
 
 ## Requirements
 

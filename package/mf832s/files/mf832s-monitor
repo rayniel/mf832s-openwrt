@@ -42,6 +42,8 @@ event_listener=
 event_guard=
 event_epoch=0
 fence=0
+auto_at=
+auto_generation=
 
 log() { logger -t mf832s "$*"; }
 notice() {
@@ -185,7 +187,6 @@ load_config() {
 			/dev/ttyACM*) suffix=${at_device#/dev/ttyACM};; *) config_error=invalid-at-device; return 1;; esac
 		case "$suffix" in ''|*[!0-9]*) config_error=invalid-at-device; return 1;; esac
 	fi
-	[ -n "$at_interface$at_device" ] || { config_error=at-port-not-explicitly-selected; return 1; }
 	[ -z "$net_device" ] || valid_name "$net_device" || { config_error=invalid-network-device; return 1; }
 	backoff=$retry_initial
 	config_error=
@@ -212,6 +213,7 @@ stamp() {
 discover() {
 	local path count candidate parent tty_path walk ifnum
 	usb='' at='' net=''
+	at_candidates=
 	count=0
 	for path in /sys/bus/usb/devices/*; do
 		[ -r "$path/idVendor" ] && [ -r "$path/idProduct" ] || continue
@@ -232,24 +234,29 @@ discover() {
 		[ -z "$at_device" ] || [ "$candidate" = "$at_device" ] || continue
 		parent=$(usb_parent "$tty_path/device") || continue
 		[ "$parent" = "$usb" ] || continue
-		if [ -n "$at_interface" ]; then
-			walk=$(readlink -f "$tty_path/device")
-			ifnum=
-			while [ "$walk" != "$usb" ] && [ -n "$walk" ]; do
-				if [ -r "$walk/bInterfaceNumber" ]; then
-					ifnum=$(cat "$walk/bInterfaceNumber")
-					break
-				fi
-				walk=${walk%/*}
-			done
-			[ "$ifnum" = "$at_interface" ] || continue
-		fi
+		walk=$(readlink -f "$tty_path/device")
+		ifnum=ff
+		while [ "$walk" != "$usb" ] && [ -n "$walk" ]; do
+			if [ -r "$walk/bInterfaceNumber" ]; then
+				ifnum=$(cat "$walk/bInterfaceNumber" | tr A-F a-f)
+				break
+			fi
+			walk=${walk%/*}
+		done
+		[ -z "$at_interface" ] || [ "$ifnum" = "$at_interface" ] || continue
 		[ -c "$candidate" ] || continue
 		count=$((count + 1))
 		at=$candidate
+		at_candidates="${at_candidates}${ifnum} ${candidate}
+"
 	done
-	[ "$count" -gt 0 ] || { discovery_reason=selected-at-port-not-ready; return 1; }
-	[ "$count" = 1 ] || { discovery_reason=multiple-matching-at-ports; return 1; }
+	if [ -n "$at_interface$at_device" ]; then
+		[ "$count" -gt 0 ] || { discovery_reason=selected-at-port-not-ready; return 1; }
+		[ "$count" = 1 ] || { discovery_reason=multiple-matching-at-ports; return 1; }
+	else
+		at=
+		at_candidates=$(printf '%s' "$at_candidates" | sort -k1,1 -k2,2)
+	fi
 	count=0
 	for path in /sys/class/net/*; do
 		candidate=${path##*/}
@@ -440,6 +447,7 @@ transaction_valid() {
 	same_generation && network_config "$net" && network_status "$net" || return 1
 	[ "$(interface_event)" = "$attempt_event" ] || return 1
 	case "$transaction_mode" in
+		probe) return 0;;
 		activate|recover) [ "$up" = false ] && [ "$pending" = false ];;
 		health) [ "$up" = true ];;
 		*) return 1;;
@@ -467,6 +475,9 @@ await_child() {
 query() {
 	local command timeout end
 	command=$1
+	# Discovery must never reach state-changing activation/recovery commands.
+	[ "$transaction_mode" != probe ] || [ "$command" = AT ] ||
+		{ at_failure=unsafe-probe-command; return 1; }
 	at_failure=no-response-or-unsupported-command
 	end=$(( $(now) + query_timeout ))
 	[ "$end" -le "$transaction_end" ] || end=$transaction_end
@@ -475,7 +486,12 @@ query() {
 	[ "$interrupted" = 0 ] && transaction_valid || { at_failure=cancelled-or-device-changed; return 1; }
 	{
 		printf 'ABORT "\\r\\nERROR\\r\\n"\nABORT "+CME ERROR:"\nABORT "\\r\\nNO CARRIER\\r\\n"\nABORT "\\r\\nBUSY\\r\\n"\nTIMEOUT %s\n' "$timeout"
-		printf "'' '%s'\n'\\\\r\\\\nOK\\\\r\\\\n' ''\n" "$command"
+		printf "'' '%s'\n'\\\\r\\\\nOK\\\\r\\\\n' " "$command"
+		if [ "$transaction_mode" = probe ]; then
+			printf "'\\\\c'\n"
+		else
+			printf "''\n"
+		fi
 	} >"$RUN/query.chat"
 	# Transcript is private and never passed to logger (it may contain an APN).
 	(
@@ -562,19 +578,95 @@ undefined_context() {
 	}
 }
 
+configure_serial() {
+	local end
+	at_failure=serial-unavailable-or-cancelled
+	[ "$interrupted" = 0 ] && transaction_valid || return 1
+	end=$(( $(now) + query_timeout ))
+	[ "$end" -le "$transaction_end" ] || end=$transaction_end
+	[ "$end" -gt "$(now)" ] || { at_failure=timeout; return 1; }
+	(
+		exec 9>&- 7>&-
+		# Do not drop DTR on close or enable hardware flow-control during probing.
+		exec stty -F "$at" 115200 raw -echo clocal -hupcl -crtscts 2>/dev/null
+	) &
+	child=$!
+	await_child "$end"
+}
+
+select_at() {
+	local cache cached_generation cached_at candidate ifnum count rc
+	[ -z "$at_interface$at_device" ] || return 0
+	cache="${STATUS_FILE%/*}/at-port"
+	cached_generation=$auto_generation
+	cached_at=$auto_at
+	if [ "$cached_generation" != "$generation" ]; then
+		cached_generation=$(sed -n '1p' "$cache" 2>/dev/null)
+		cached_at=$(sed -n '2p' "$cache" 2>/dev/null)
+	fi
+	if [ "$cached_generation" = "$generation" ] &&
+		printf '%s\n' "$at_candidates" | awk -v port="$cached_at" '$2==port { found=1 } END { exit !found }'; then
+		at=$cached_at
+		same_generation || { at=; return 1; }
+		if [ "$auto_generation:$auto_at" != "$generation:$at" ]; then
+			log "AT probe selected port=$at reason=cached-confirmed-port"
+		fi
+		auto_at=$at auto_generation=$generation
+		return 0
+	fi
+	[ "$(now)" -ge "$next_try" ] || return 1
+	count=$(printf '%s\n' "$at_candidates" | awk 'NF==2 { n++ } END { print n+0 }')
+	if [ "$count" -eq 0 ] || [ "$count" -gt 8 ]; then
+		at_failure=no-serial-candidates
+		[ "$count" -le 8 ] || at_failure=too-many-serial-candidates
+	else
+		set_stage at-discovery 'probing same-parent serial ports with AT only'
+		transaction_active=1
+		transaction_mode=probe
+		attempt_event=$(interface_event)
+		transaction_end=$(( $(now) + transaction_timeout ))
+		rc=1
+		while read -r ifnum candidate; do
+			[ -n "$candidate" ] || continue
+			at=$candidate
+			log "AT probe trying port=$at interface=$ifnum order=USB-interface-number"
+			if configure_serial && query AT; then
+				rc=0
+				break
+			fi
+			log "AT probe failed port=$at reason=$at_failure"
+			[ "$interrupted" = 0 ] && transaction_valid &&
+				[ "$(now)" -lt "$transaction_end" ] || break
+		done <<EOF
+$at_candidates
+EOF
+		transaction_active=0
+		if [ "$rc" = 0 ]; then
+			auto_at=$at auto_generation=$generation
+			# Private runtime cache survives monitor restarts, not USB generations.
+			printf '%s\n%s\n' "$generation" "$at" >"$cache.$$" &&
+				mv -f "$cache.$$" "$cache" ||
+				log 'AT probe cache write failed; retaining in-memory selection'
+			log "AT probe selected port=$at interface=$ifnum reason=first-confirmed-AT-response"
+			backoff=$retry_initial
+			next_try=0
+			return 0
+		fi
+	fi
+	at=
+	retry
+	stage_failure at-discovery "automatic AT probe failed ($at_failure); retry scheduled at $next_try"
+	return 1
+}
+
 begin_transaction() {
 	transaction_end=$(( $(now) + transaction_timeout ))
 	if [ "$transaction_mode" = health ]; then
 		set_stage health-check 'performing scheduled modem health check' quiet
 	else
-		set_stage serial-at 'checking configured serial port and AT responsiveness'
+		set_stage serial-at 'checking selected serial port and AT responsiveness'
 	fi
-	(
-		exec 9>&- 7>&-
-		exec stty -F "$at" 115200 raw -echo clocal 2>/dev/null
-	) &
-	child=$!
-	await_child "$transaction_end" || { at_failure=serial-unavailable-or-cancelled; return 1; }
+	configure_serial || return 1
 	query AT
 }
 
@@ -762,11 +854,6 @@ reconcile() {
 	fi
 	generation=$found_generation
 	if [ "$generation" != "$previous" ]; then
-		set_stage usb-associated "confirmed AT port and USB data device; at=$at net=$net"
-	else
-		set_stage usb-associated "confirmed AT port and USB data device; at=$at net=$net" quiet
-	fi
-	if [ "$generation" != "$previous" ]; then
 		network_down || { retry; return; }
 		next_try=0
 		backoff=$retry_initial
@@ -785,6 +872,12 @@ reconcile() {
 		network_down
 		return
 	}
+	select_at || return
+	if [ "$generation" != "$previous" ]; then
+		set_stage usb-associated "confirmed AT port and USB data device; at=$at net=$net"
+	else
+		set_stage usb-associated "confirmed AT port and USB data device; at=$at net=$net" quiet
+	fi
 	diagnostic=
 	lease_changed=0
 	if [ "$has_ipv4" != "$observed_ipv4" ]; then
@@ -1003,7 +1096,11 @@ if ! load_config; then
 	write_state
 	exit 1
 fi
-log "Configuration accepted: target interface=$interface; explicit AT selection present"
+if [ -n "$at_interface$at_device" ]; then
+	log "Configuration accepted: target interface=$interface; explicit AT selection takes priority"
+else
+	log "Configuration accepted: target interface=$interface; automatic AT detection enabled"
+fi
 if [ "$interface" != mf832s ]; then
 	log "Configured target differs from default mf832s interface; managing configured target $interface"
 fi
