@@ -24,7 +24,8 @@ case "${0##*/}" in
 esac
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
-TMP=$(mktemp -d)
+TMP=$ROOT/package/mf832s/tests/.events.$$
+mkdir "$TMP"
 sed '/^\. \/lib\/functions.sh$/d; /^log .Starting MF832S monitor build=/,$d' \
 	"$ROOT/package/mf832s/files/mf832s-monitor" >"$TMP/functions"
 . "$TMP/functions"
@@ -54,6 +55,21 @@ event_barrier || exit 1
 [ "$(interface_event)" != "$initial" ]
 [ "$(cat "$RUN/iface-sequence")" = 1 ]
 printf 'ok - real FIFO reader/fences preserve fast target edges and ignore other interfaces\n'
+old_epoch=$event_epoch
+old_attempt=$(interface_event)
+interface=MiXeD_4G
+ensure_events || exit 1
+[ "$event_epoch" -gt "$old_epoch" ]
+[ "$(interface_event)" != "$old_attempt" ]
+[ "$(cat "$RUN/iface-sequence")" = 0 ]
+printf '{ "network.interface": {"interface":"modem","action":"ifdown"} }\n' >&8
+printf '{ "network.interface": {"interface":"mixed_4g","action":"ifdown"} }\n' >&8
+event_barrier || exit 1
+[ "$(cat "$RUN/iface-sequence")" = 0 ]
+printf '{ "network.interface": {"interface":"MiXeD_4G","action":"ifdown"} }\n' >&8
+event_barrier || exit 1
+[ "$(cat "$RUN/iface-sequence")" = 1 ]
+printf 'ok - target change restarts listener with fresh epoch/fence and exact case-sensitive event routing\n'
 old_listener=$event_listener old_reader=$event_reader old_guard=$event_guard old_epoch=$event_epoch
 kill "$event_listener"
 wait "$event_listener" 2>/dev/null || :

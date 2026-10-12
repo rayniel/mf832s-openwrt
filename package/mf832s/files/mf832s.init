@@ -3,6 +3,8 @@
 START=95
 STOP=10
 USE_PROCD=1
+EXTRA_COMMANDS="network_changed"
+EXTRA_HELP="	network_changed Wake monitor after network configuration changes"
 
 start_service() {
 	procd_open_instance
@@ -18,5 +20,12 @@ reload_service() {
 }
 
 service_triggers() {
-	procd_add_reload_trigger mf832s network
+	procd_add_reload_trigger mf832s
+	procd_add_config_trigger "config.change" "network" /etc/init.d/mf832s network_changed
+}
+
+network_changed() {
+	local signal
+	signal=$(kill -l USR1)
+	ubus -t 1 call service signal "{\"name\":\"mf832s\",\"signal\":$signal}" >/dev/null 2>&1
 }

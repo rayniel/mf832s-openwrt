@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=mf832s
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=5
+PKG_RELEASE:=6
 PKG_LICENSE:=GPL-3.0-only
 PKG_LICENSE_FILES:=LICENSE
 PKGARCH:=all
@@ -15,7 +15,7 @@ define Package/mf832s
   SUBMENU:=WWAN
   TITLE:=ZTE MF832S AT activation and USB Ethernet monitor
   URL:=https://github.com/rayniel/mf832s-openwrt
-  DEPENDS:=+busybox +chat +coreutils-stty +flock +netifd +uci +ubus +procd +jsonfilter
+  DEPENDS:=+busybox +chat +coreutils-stty +coreutils-od +flock +netifd +uci +ubus +procd +jsonfilter
 endef
 
 define Package/mf832s/description

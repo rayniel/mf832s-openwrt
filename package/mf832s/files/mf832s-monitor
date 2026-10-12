@@ -9,6 +9,9 @@ LOCK=/var/run/mf832s.lock
 STATUS_FILE=/var/run/mf832s/status
 child=
 owned_device=
+owned_interface=
+interface=
+configured_interface=
 owned_usb=
 owned_generation=
 generation=
@@ -41,6 +44,7 @@ event_reader=
 event_listener=
 event_guard=
 event_epoch=0
+event_interface=
 fence=0
 auto_at=
 auto_generation=
@@ -132,7 +136,7 @@ load_config() {
 	config_load mf832s
 	config_get_bool enabled main enabled 0
 	[ "$enabled" = 1 ] || { config_error=disabled; return 1; }
-	config_get interface main interface mf832s
+	config_get configured_interface main interface ''
 	config_get apn main apn ''
 	config_get pdp_type main pdp_type IPV4V6
 	config_get cid main cid 1
@@ -154,7 +158,8 @@ load_config() {
 	config_get recover_mode main recover_mode cfun_cycle
 	config_get recover_threshold main recover_threshold 3
 	config_get recover_cooldown main recover_cooldown 120
-	valid_name "$interface" || { config_error=invalid-target-interface; return 1; }
+	[ -z "$configured_interface" ] || valid_name "$configured_interface" ||
+		{ config_error=invalid-target-interface; return 1; }
 	# APNs cannot inject chat syntax or AT commands; the empty default is allowed.
 	case "$apn" in *[!a-zA-Z0-9._-]*) config_error=invalid-apn-format; return 1;; esac
 	[ "${#apn}" -le 100 ] || { config_error=invalid-apn-length; return 1; }
@@ -271,22 +276,49 @@ discover() {
 	discovery_reason=discovered
 }
 
-network_config() {
-	local proto device section_type managed selected
+matching_interface() {
+	local proto device
+	config_get proto "$1" proto
+	config_get device "$1" device
+	[ "$proto" = dhcp ] && [ "$device" = "$binding_device" ] || return 0
+	valid_name "$1" || return 0
+	binding_count=$((binding_count + 1))
+	resolved_interface=$1
+}
+
+resolve_target() {
+	local managed selected proto device section_type binding_device binding_count
+	resolved_interface= target_device=
 	config_load mf832s
 	config_get_bool managed main enabled 0
-	config_get selected main interface mf832s
+	config_get selected main interface ''
 	[ "$managed" = 1 ] || { validation_reason=service-disabled; return 1; }
-	[ "$selected" = "$interface" ] || { validation_reason=service-target-mismatch; return 1; }
+	[ "$selected" = "$configured_interface" ] ||
+		{ validation_reason=service-target-mismatch; return 1; }
 	config_load network
-	config_get section_type "$interface" TYPE
-	config_get proto "$interface" proto
-	config_get device "$interface" device
-	target_device=$device
-	[ "$section_type" = interface ] || { validation_reason=target-interface-missing; return 1; }
-	[ "$proto" = dhcp ] || { validation_reason=target-protocol-not-dhcp; return 1; }
-	[ "$device" = "$1" ] || { validation_reason=target-device-not-discovered-usb-net; return 1; }
+	if [ -n "$selected" ]; then
+		config_get section_type "$selected" TYPE
+		config_get proto "$selected" proto
+		config_get device "$selected" device
+		target_device=$device
+		[ "$section_type" = interface ] || { validation_reason=target-interface-missing; return 1; }
+		[ "$proto" = dhcp ] || { validation_reason=target-protocol-not-dhcp; return 1; }
+		[ "$device" = "$1" ] || { validation_reason=target-device-not-discovered-usb-net; return 1; }
+		resolved_interface=$selected
+	else
+		binding_device=$1 binding_count=0
+		config_foreach matching_interface interface
+		[ "$binding_count" -gt 0 ] || { validation_reason=no-matching-dhcp-interface; return 1; }
+		[ "$binding_count" = 1 ] || { resolved_interface=; validation_reason=multiple-matching-dhcp-interfaces; return 1; }
+		target_device=$1
+	fi
 	validation_reason=valid
+}
+
+network_config() {
+	resolve_target "$1" || return 1
+	[ -n "$interface" ] && [ "$resolved_interface" = "$interface" ] ||
+		{ validation_reason=target-interface-changed; return 1; }
 }
 
 network_status() {
@@ -320,7 +352,8 @@ network_down() {
 	local parent
 	[ -n "$owned_device" ] || return 0
 	# Never bring down an interface whose configuration or physical owner changed.
-	if network_config "$owned_device" && network_status "$owned_device"; then
+	if [ "$owned_interface" = "$interface" ] &&
+		network_config "$owned_device" && network_status "$owned_device"; then
 		parent=$(usb_parent "/sys/class/net/$owned_device/device")
 		if [ -z "$parent" ] || {
 			[ "$parent" = "$owned_usb" ] &&
@@ -329,7 +362,7 @@ network_down() {
 			ubus -t 2 call "network.interface.$interface" down >/dev/null 2>&1 || return 1
 		fi
 	fi
-	owned_device='' owned_usb='' owned_generation='' lease_deadline=0 owned_online=0 owned_event=''
+	owned_interface='' owned_device='' owned_usb='' owned_generation='' lease_deadline=0 owned_online=0 owned_event=''
 }
 
 coordinate_pending() {
@@ -411,12 +444,14 @@ event_barrier() {
 }
 
 ensure_events() {
-	if [ -n "$event_listener" ] && [ -n "$event_reader" ] && [ -n "$event_guard" ] &&
+	if [ "$event_interface" = "$interface" ] &&
+		[ -n "$event_listener" ] && [ -n "$event_reader" ] && [ -n "$event_guard" ] &&
 		kill -0 "$event_listener" 2>/dev/null && kill -0 "$event_reader" 2>/dev/null &&
 		kill -0 "$event_guard" 2>/dev/null; then
 		return 0
 	fi
 	stop_events
+	event_interface=$interface
 	event_epoch=$((event_epoch + 1))
 	rm -f "$RUN/events" "$RUN/fence" "$RUN/lifetime"
 	mkfifo "$RUN/events" "$RUN/lifetime" || return 1
@@ -444,6 +479,7 @@ transaction_valid() {
 	kill -0 "$event_listener" 2>/dev/null &&
 		kill -0 "$event_reader" 2>/dev/null &&
 		kill -0 "$event_guard" 2>/dev/null || return 1
+	[ "$event_interface" = "$interface" ] || return 1
 	same_generation && network_config "$net" && network_status "$net" || return 1
 	[ "$(interface_event)" = "$attempt_event" ] || return 1
 	case "$transaction_mode" in
@@ -587,8 +623,8 @@ configure_serial() {
 	[ "$end" -gt "$(now)" ] || { at_failure=timeout; return 1; }
 	(
 		exec 9>&- 7>&-
-		# Do not drop DTR on close or enable hardware flow-control during probing.
-		exec stty -F "$at" 115200 raw -echo clocal -hupcl -crtscts 2>/dev/null
+		# USB virtual ports may reject baud changes; preserve the driver's speed.
+		exec stty -F "$at" raw -echo clocal -hupcl -crtscts 2>/dev/null
 	) &
 	child=$!
 	await_child "$end"
@@ -651,8 +687,6 @@ EOF
 				mv -f "$cache.$$" "$cache" ||
 				log 'AT probe cache write failed; retaining in-memory selection'
 			log "AT probe selected port=$at interface=$ifnum reason=first-confirmed-AT-response"
-			backoff=$retry_initial
-			next_try=0
 			return 0
 		fi
 	fi
@@ -796,7 +830,9 @@ activate() {
 }
 
 retry() {
-	next_try=$(( $(now) + backoff ))
+	local deadline
+	deadline=$(( $(now) + backoff ))
+	[ "$deadline" -le "$next_try" ] || next_try=$deadline
 	backoff=$((backoff * 2))
 	[ "$backoff" -le "$retry_max" ] || backoff=$retry_max
 	write_state
@@ -841,12 +877,6 @@ recover() {
 
 reconcile() {
 	local previous current activation_rc recover_owned lease_changed previous_health
-	set_stage event-listener 'verifying ubus event listener' quiet
-	ensure_events || {
-		stage_failure event-listener 'listener startup or readiness barrier failed; refusing connection changes'
-		retry
-		return
-	}
 	previous=$generation
 	set_stage usb-discovery 'searching configured VID/PID and USB topology' quiet
 	if ! discover; then
@@ -864,10 +894,32 @@ reconcile() {
 		health_bad=0
 		recover_bad=0
 	fi
-	set_stage DHCP-interface-validation 'checking the configured logical DHCP interface and USB binding' quiet
-	network_config "$net" || {
-		stage_failure DHCP-interface-validation "$validation_reason; configured target must be an existing DHCP section bound to $net"
+	set_stage DHCP-interface-validation 'finding an existing DHCP interface bound to the USB data device' quiet
+	resolve_target "$net" || {
 		network_down
+		if [ -n "$interface" ]; then
+			interface=
+			stop_events
+			retry
+		fi
+		has_ipv4=false observed_ipv4=false state_health=unknown
+		stage_failure DHCP-interface-validation "$validation_reason; waiting for a unique DHCP section bound to $net"
+		write_state
+		return
+	}
+	if [ "$interface" != "$resolved_interface" ]; then
+		# A renamed/rebound section is not the connection we started. Forget it,
+		# never tear down the replacement, and preserve modem retry/cooldown.
+		[ -z "$interface" ] || retry
+		owned_interface='' owned_device='' owned_usb='' owned_generation='' owned_event='' owned_online=0
+		lease_deadline=0 health_next=0 health_bad=0 observed_ipv4=false
+		state_health=unknown has_ipv4=false
+		interface=$resolved_interface
+	fi
+	set_stage event-listener 'verifying target-specific ubus event listener' quiet
+	ensure_events || {
+		stage_failure event-listener 'listener startup or readiness barrier failed; refusing connection changes'
+		retry
 		return
 	}
 	network_status "$net" || {
@@ -875,6 +927,11 @@ reconcile() {
 		network_down
 		return
 	}
+	if [ "$(now)" -lt "$next_try" ]; then
+		set_stage backoff "retry scheduled after bounded backoff at $next_try" quiet
+		write_state
+		return
+	fi
 	select_at || return
 	if [ "$generation" != "$previous" ]; then
 		set_stage usb-associated "confirmed AT port and USB data device; at=$at net=$net"
@@ -1063,6 +1120,7 @@ reconcile() {
 		return
 	}
 	if ubus -t 2 call "network.interface.$interface" up >/dev/null 2>&1; then
+		owned_interface=$interface
 		owned_device=$net
 		owned_usb=$usb
 		owned_generation=$generation
@@ -1100,12 +1158,9 @@ if ! load_config; then
 	exit 1
 fi
 if [ -n "$at_interface$at_device" ]; then
-	log "Configuration accepted: target interface=$interface; explicit AT selection takes priority"
+	log "Configuration accepted: target selector=${configured_interface:-auto}; explicit AT selection takes priority"
 else
-	log "Configuration accepted: target interface=$interface; automatic AT detection enabled"
-fi
-if [ "$interface" != mf832s ]; then
-	log "Configured target differs from default mf832s interface; managing configured target $interface"
+	log "Configuration accepted: target selector=${configured_interface:-auto}; automatic AT detection enabled"
 fi
 for tool in chat stty ubus jsonfilter flock mkfifo mktemp; do
 	command -v "$tool" >/dev/null 2>&1 || {

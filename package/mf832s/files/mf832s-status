@@ -5,7 +5,7 @@ export PATH
 
 STATUS_FILE=/var/run/mf832s/status
 target=$(uci -q get mf832s.main.interface 2>/dev/null)
-target=${target:-mf832s}
+selector=$target
 enabled=$(uci -q get mf832s.main.enabled 2>/dev/null)
 enabled=${enabled:-0}
 candidate=
@@ -64,6 +64,7 @@ if [ -r "$STATUS_FILE" ]; then
 		esac
 	done <"$STATUS_FILE"
 fi
+[ -n "$selector" ] || target=${state_target:-}
 
 monitor_alive=0
 case "$pid" in ''|*[!0-9]*) ;; *)
@@ -147,6 +148,7 @@ if [ "$json" = 1 ]; then
 	printf '{"service":'; json_string "$service"
 	printf ',"pid":'; json_string "$pid"
 	printf ',"target_interface":'; json_string "$target"
+	printf ',"interface_selector":'; json_string "$selector"
 	printf ',"configured_device":'; json_string "$configured_net"
 	printf ',"discovered_usb":'; json_string "$usb"
 	printf ',"discovered_at_port":'; json_string "$at"
@@ -163,7 +165,7 @@ fi
 
 printf 'Service: %s\n' "$service"
 [ -z "$pid" ] || printf 'Monitor PID: %s%s\n' "$pid" "$([ "$monitor_alive" = 1 ] || printf ' (not verified active)')"
-printf 'Configured target: %s (enabled=%s)\n' "$target" "$enabled"
+printf 'Configured target: %s; resolved target: %s (enabled=%s)\n' "${selector:-auto}" "${target:-none}" "$enabled"
 printf 'Network interface device: %s; optional device filter: %s\n' \
 	"${target_device:-unknown}" "${configured_net:-none}"
 printf 'Discovered USB: %s; AT port: %s; data device: %s\n' \
@@ -173,21 +175,66 @@ printf 'Stage started: %s; state updated: %s\n' "${stage_started:-unknown}" "${u
 printf 'Next retry in: %ss; DHCP deadline remaining: %ss\n' "$retry_remaining" "$lease_remaining"
 printf 'IPv4 lease present: %s; modem health: %s\n' "$has_ipv4" "$health"
 if [ "$check" = 1 ]; then
-	printf '\nConfiguration diagnostics for candidate %s:\n' "$candidate"
-	if [ "$target" != "$candidate" ]; then
-		printf '  MISMATCH: service targets %s, not %s; set mf832s.main.interface to the intended interface.\n' "$target" "$candidate"
-	else
+	if [ -z "$selector" ]; then
+		printf '\nAutomatic interface selection: unique DHCP binding to the selected USB data device; names are case-sensitive.\n'
+		# Read current physical association, not a possibly stale monitor snapshot.
+		check_net= check_count=0 check_usb= check_usb_count=0
+		vid=$(uci -q get mf832s.main.vid)
+		pid_filter=$(uci -q get mf832s.main.pid)
+		usb_path_filter=$(uci -q get mf832s.main.usb_path)
+		serial_filter=$(uci -q get mf832s.main.serial)
+		net_filter=$(uci -q get mf832s.main.net_device)
+		for path in /sys/bus/usb/devices/*; do
+			[ -r "$path/idVendor" ] && [ -r "$path/idProduct" ] || continue
+			[ "$(cat "$path/idVendor")" = "$(printf '%s' "${vid:-19d2}" | tr A-F a-f)" ] &&
+				[ "$(cat "$path/idProduct")" = "$(printf '%s' "${pid_filter:-0199}" | tr A-F a-f)" ] || continue
+			[ -z "$usb_path_filter" ] || [ "${path##*/}" = "$usb_path_filter" ] || continue
+			[ -z "$serial_filter" ] || [ "$(cat "$path/serial" 2>/dev/null)" = "$serial_filter" ] || continue
+			check_usb_count=$((check_usb_count + 1)) check_usb=$(readlink -f "$path")
+		done
+		for path in /sys/class/net/*; do
+			[ "$check_usb_count" = 1 ] || break
+			parent=$(usb_parent_of "$path/device") || continue
+			[ "$parent" = "$check_usb" ] || continue
+			[ -z "$net_filter" ] || [ "${path##*/}" = "$net_filter" ] || continue
+			check_count=$((check_count + 1)) check_net=${path##*/}
+		done
+		binding_count=0 resolved=
+		if [ "$check_count" = 1 ]; then
+			for section_name in $(uci -q show network | sed -n 's/^network\.\([^=]*\)=interface$/\1/p'); do
+				[ "$(uci -q get "network.$section_name.proto")" = dhcp ] &&
+					[ "$(uci -q get "network.$section_name.device")" = "$check_net" ] || continue
+				binding_count=$((binding_count + 1)) resolved=$section_name
+			done
+		fi
+		case "$binding_count" in
+			0) printf '  WAITING: no unique USB data device with a matching DHCP binding is ready.\n';;
+			1) printf '  OK: automatic target is %s (device=%s).\n' "$resolved" "$check_net";;
+			*) printf '  BLOCKED: multiple matching DHCP interfaces; remove duplicate bindings or set an explicit interface selector.\n';;
+		esac
+		[ -n "$candidate" ] || { [ "$binding_count" != 1 ] || candidate=$resolved; }
+		if [ -n "$candidate" ] && { [ "$binding_count" != 1 ] || [ "$candidate" != "$resolved" ]; }; then
+			printf '  WAITING: candidate %s is not currently the unique automatic target.\n' "$candidate"
+		fi
+	fi
+	printf '\nConfiguration diagnostics for candidate %s:\n' "${candidate:-none}"
+	if [ -n "$selector" ] && [ "$selector" != "$candidate" ]; then
+		printf '  MISMATCH: service targets %s, not %s; explicit selector is case-sensitive.\n' "$selector" "$candidate"
+	elif [ -n "$selector" ]; then
 		printf '  OK: service target matches %s.\n' "$candidate"
+	else
+		printf '  AUTO: no logical interface name is required in plugin configuration.\n'
 	fi
 	[ "$enabled" = 1 ] || printf '  BLOCKED: mf832s.main.enabled is 0; selecting eth1 in network does not start AT activation.\n'
 	section=$(uci -q get "network.$candidate" 2>/dev/null)
 	proto=$(uci -q get "network.$candidate.proto" 2>/dev/null)
 	device=$(uci -q get "network.$candidate.device" 2>/dev/null)
 	old_ifname=$(uci -q get "network.$candidate.ifname" 2>/dev/null)
-	[ "$section" = interface ] || printf '  ERROR: network.%s interface section does not exist.\n' "$candidate"
-	[ "$proto" = dhcp ] || printf '  ERROR: network.%s protocol is %s, not dhcp.\n' "$candidate" "${proto:-unset}"
+	[ -z "$candidate" ] || [ "$section" = interface ] || printf '  ERROR: network.%s interface section does not exist.\n' "$candidate"
+	[ -z "$candidate" ] || [ "$proto" = dhcp ] || printf '  ERROR: network.%s protocol is %s, not dhcp.\n' "$candidate" "${proto:-unset}"
 	[ -z "$old_ifname" ] || printf '  WARNING: legacy ifname=%s is present; use the OpenWrt device option instead.\n' "$old_ifname"
-	printf '  network.%s device=%s; choose the verified USB data device (eth1 is not assumed).\n' "$candidate" "${device:-unset}"
+	[ -z "$candidate" ] ||
+		printf '  network.%s device=%s; choose the verified USB data device (eth1 is not assumed).\n' "$candidate" "${device:-unset}"
 	at_interface=$(uci -q get mf832s.main.at_interface 2>/dev/null)
 	at_device=$(uci -q get mf832s.main.at_device 2>/dev/null)
 	vid=$(uci -q get mf832s.main.vid 2>/dev/null)
@@ -197,7 +244,7 @@ if [ "$check" = 1 ]; then
 	vid=$(printf '%s' "${vid:-19d2}" | tr A-F a-f)
 	pid_filter=$(printf '%s' "${pid_filter:-0199}" | tr A-F a-f)
 	[ -n "$at_interface$at_device" ] ||
-		printf '  BLOCKED: no explicit AT port selected; configure verified at_interface or at_device, do not guess ttyUSB numbering.\n'
+		printf '  AUTO: AT-only discovery probes same-USB-parent serial ports after unique DHCP binding validation.\n'
 	if [ -z "$usb" ] && [ "$service" != running ]; then
 		printf '  USB discovery: no active monitor discovery result is available; inspect VID/PID and USB drivers.\n'
 	elif [ -n "$usb" ]; then
@@ -226,7 +273,7 @@ if [ "$check" = 1 ]; then
 	if [ -n "$net_parent" ]; then
 		printf '  USB parent for %s: %s (%s:%s)\n' "$device" "${net_parent##*/}" \
 			"$(cat "$net_parent/idVendor" 2>/dev/null)" "$(cat "$net_parent/idProduct" 2>/dev/null)"
-		if [ -n "$selected_usb" ] && [ "$net_parent" != "$selected_usb" ]; then
+		if [ "$match_count" = 1 ] && [ "$net_parent" != "$selected_usb" ]; then
 			printf '  ERROR: %s is not attached to the uniquely selected USB modem.\n' "$device"
 		elif [ "$match_count" = 1 ]; then
 			printf '  OK: %s belongs to the selected USB modem.\n' "$device"
@@ -234,7 +281,7 @@ if [ "$check" = 1 ]; then
 	else
 		printf '  USB parent for %s: unavailable; device may be absent or not a USB network function.\n' "${device:-unset}"
 	fi
-	if [ -n "$selected_usb" ]; then
+	if [ "$match_count" = 1 ]; then
 		at_count=0
 		for tty_path in /sys/class/tty/ttyUSB* /sys/class/tty/ttyACM*; do
 			[ -e "$tty_path/device" ] || continue
@@ -257,11 +304,15 @@ if [ "$check" = 1 ]; then
 			[ -c "$at_node" ] || continue
 			at_count=$((at_count + 1))
 		done
-		case "$at_count" in
-			0) printf '  AT port: no ready serial device matches the explicit selector and selected USB modem.\n';;
-			1) printf '  AT port: one ready serial device matches the explicit selector.\n';;
-			*) printf '  AT port: %s matching serial devices; selector is ambiguous.\n' "$at_count";;
-		esac
+		if [ -z "$at_interface$at_device" ]; then
+			printf '  AT discovery: %s ready same-parent serial candidates; bounded AT-only probing selects a responsive port.\n' "$at_count"
+		else
+			case "$at_count" in
+				0) printf '  AT port: no ready serial device matches the explicit selector and selected USB modem.\n';;
+				1) printf '  AT port: one ready serial device matches the explicit selector.\n';;
+				*) printf '  AT port: %s matching serial devices; selector is ambiguous.\n' "$at_count";;
+			esac
+		fi
 	fi
 	printf '  AT activation and an IPv4 lease are separate stages; lease presence does not prove public reachability.\n'
 fi

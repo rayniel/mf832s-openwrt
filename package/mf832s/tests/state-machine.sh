@@ -2,12 +2,13 @@
 # Hardware-free regression tests: exercise the production functions with fake AT/netifd.
 set -u
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
-TMP=$(mktemp -d) || exit 1
+TMP=$ROOT/package/mf832s/tests/.state-machine.$$
+mkdir "$TMP" || exit 1
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 sed '/^\. \/lib\/functions.sh$/d; /^log .Starting MF832S monitor build=/,$d' \
 	"$ROOT/package/mf832s/files/mf832s-monitor" >"$TMP/functions" || exit 1
 . "$TMP/functions"
-sed -n '/^ensure_events() {/,/^}/p; /^event_barrier() {/,/^}/p' \
+sed -n '/^ensure_events() {/,/^}/p; /^event_barrier() {/,/^}/p; /^stop_events() {/,/^}/p' \
 	"$TMP/functions" >"$TMP/real-events"
 RUN=$TMP
 TRACE=$TMP/trace
@@ -51,12 +52,22 @@ config_get() {
 		mf832s:recover_mode) value=$cfg_recover_mode;;
 		mf832s:recover_threshold) value=$cfg_recover_threshold;;
 		mf832s:recover_cooldown) value=$cfg_recover_cooldown;;
-		network:TYPE) value=interface;;
+		network:TYPE)
+			if [ "$2" = "$network_interface" ] || [ "$2" = "$other_interface" ]; then
+				value=$cfg_type
+			else
+				value=
+			fi;;
 		network:proto) value=$cfg_proto;;
-		network:device) value=$cfg_device;;
+		network:device)
+			if [ "$2" = "$other_interface" ]; then value=$other_device; else value=$cfg_device; fi;;
 		*) fail "unexpected config lookup $config:$3";;
 	esac
 	eval "$1=\$value"
+}
+config_foreach() {
+	[ "$cfg_type" != interface ] || "$1" "$network_interface"
+	[ -z "$other_interface" ] || "$1" "$other_interface"
 }
 uci() {
 	case "$*" in
@@ -82,7 +93,8 @@ discover() {
 	fi
 	found_generation=$physical_generation
 }
-ensure_events() { [ "$events_ok" = 1 ]; }
+ensure_events() { event_interface=$interface; [ "$events_ok" = 1 ]; }
+stop_events() { :; }
 event_barrier() {
 	[ "$events_ok" = 1 ] && [ "$barrier_ok" = 1 ] || return 1
 	# A fence drains events queued by the service's own down.
@@ -106,7 +118,7 @@ jsonfilter() {
 }
 ubus() {
 	case "$*" in
-		'-t 2 call network.interface.modem status')
+		"-t 2 call network.interface.$interface status")
 			[ "$status_ok" = 1 ] || return 1
 			# Simulate a lease completing between pending detection and coordination.
 			if [ "$online_on_check" -gt 0 ]; then
@@ -118,16 +130,16 @@ ubus() {
 			printf '{"up":%s,"pending":%s,"available":%s,"device":"%s","l3_device":"%s","ipv4-address":[{"address":"%s"}]}\n' \
 				"$fake_up" "$fake_pending" "$fake_available" "$fake_device" "$fake_l3" "$fake_ipv4"
 			;;
-		'-t 2 call network.interface.modem down')
-			printf 'DOWN modem\n' >>"$TRACE"
+		"-t 2 call network.interface.$interface down")
+			printf 'DOWN %s\n' "$interface" >>"$TRACE"
 			[ "$down_ok" = 1 ] || return 1
 			fake_up=false fake_pending=false queued_down=1
 			if [ "$real_events" = 1 ]; then
-				printf '{ "network.interface": {"interface":"modem","action":"ifdown"} }\n' >"$SIM_FEED"
+				printf '{ "network.interface": {"interface":"%s","action":"ifdown"} }\n' "$interface" >"$SIM_FEED"
 			fi
 			;;
-		'-t 2 call network.interface.modem up')
-			printf 'UP modem\n' >>"$TRACE"
+		"-t 2 call network.interface.$interface up")
+			printf 'UP %s\n' "$interface" >>"$TRACE"
 			fake_pending=true
 			;;
 		'-t 1 call service signal '*)
@@ -156,6 +168,9 @@ query() {
 			usb) physical_generation=usb:2;;
 			pending) fake_pending=true;;
 			binding) cfg_device=lan0;;
+			rename) network_interface=Renamed;;
+			delete) cfg_type=deleted;;
+			ambiguity) other_interface=Duplicate other_device=usb0;;
 			event)
 				sequence=$((sequence + 1))
 				printf '%s\n' "$sequence" >"$RUN/iface-sequence"
@@ -168,6 +183,7 @@ reset() {
 	: >"$TRACE"
 	STATUS_FILE=$RUN/status
 	interface=modem cfg_interface=modem cfg_enabled=1 cfg_proto=dhcp cfg_device=usb0
+	configured_interface=modem network_interface=modem cfg_type=interface other_interface='' other_device=lan0
 	config=mf832s
 	cfg_apn='' cfg_pdp_type=IPV4V6 cfg_cid=1 cfg_vid=19d2 cfg_pid=0199
 	cfg_usb_path='' cfg_serial='' cfg_at_interface=00 cfg_at_device=''
@@ -182,10 +198,10 @@ reset() {
 	real_events=0
 	online_on_check=0
 	printf '0\n' >"$RUN/status-count"
-	clock=100 sequence=0 event_epoch=1
+	clock=100 sequence=0 event_epoch=1 event_interface=modem
 	printf '0\n' >"$RUN/iface-sequence"
 	event_listener=$$ event_reader=$$ event_guard=$$
-	owned_device='' owned_usb='' owned_generation='' owned_event='' owned_online=0
+	owned_interface='' owned_device='' owned_usb='' owned_generation='' owned_event='' owned_online=0
 	next_try=0 lease_deadline=0 interrupted=0 transaction_active=0 health_next=0
 	health_bad=0 recover_bad=0 recover_next=0 diagnostic='' at_failure=unknown-response
 	retry_initial=5 retry_max=120 backoff=5 dhcp_timeout=60 health_interval=30
@@ -506,6 +522,16 @@ assert_count 'DOWN modem' 1
 assert_count 'AT+ZGACT=1,1' 2
 assert_order
 stop_events
+stop_events() { :; }
+ensure_events() { event_interface=$interface; [ "$events_ok" = 1 ]; }
+event_barrier() {
+	[ "$events_ok" = 1 ] && [ "$barrier_ok" = 1 ] || return 1
+	if [ "$queued_down" = 1 ]; then
+		sequence=$((sequence + 1))
+		printf '%s\n' "$sequence" >"$RUN/iface-sequence"
+		queued_down=0
+	fi
+}
 exec 8>&-
 trap - USR1
 RUN=$TMP
@@ -526,4 +552,135 @@ EOF
 [ "$(cat "$RUN/fence")" = 42 ] || fail 'event fence not acknowledged'
 assert_count "SIGNAL -USR1 $$" 1
 printf 'ok - event reader filters other interfaces and preserves down/up before fence\n'
+kill() {
+	[ "$*" != '-l USR1' ] || { printf '10\n'; return; }
+	command kill "$@"
+}
+
+reset
+cfg_interface=''
+load_config || fail 'empty interface selector rejected'
+[ -z "$configured_interface" ] || fail 'auto selector default was not empty'
+interface=''
+network_interface=MiXeD_4G
+reconcile
+assert_count 'UP MiXeD_4G' 1
+assert_count 'AT+ZGACT=1,1' 1
+[ "$owned_interface" = MiXeD_4G ] || fail 'ownership did not record exact logical name'
+printf 'ok - empty selector discovers arbitrary case-sensitive DHCP name before activation\n'
+
+for absent in deleted static wrong-device; do
+	reset
+	cfg_interface='' configured_interface='' interface=''
+	case "$absent" in
+		deleted) cfg_type=deleted;;
+		static) cfg_proto=static;;
+		wrong-device) cfg_device=lan0;;
+	esac
+	reconcile
+	assert_count AT 0
+	assert_count 'UP modem' 0
+	[ "$validation_reason" = no-matching-dhcp-interface ] || fail 'absent binding not explained'
+done
+reset
+cfg_interface='' configured_interface='' interface=''
+other_interface=Second other_device=usb0
+reconcile
+assert_count AT 0
+[ "$validation_reason" = multiple-matching-dhcp-interfaces ] || fail 'ambiguity not refused'
+cfg_interface=modem
+load_config
+reconcile
+assert_count 'UP modem' 1
+printf 'ok - no DHCP binding waits; duplicate bindings refuse AT unless explicitly selected\n'
+
+reset
+cfg_interface='' configured_interface=''
+connect
+network_interface=Renamed
+reconcile
+assert_count 'DOWN modem' 0
+assert_count 'UP Renamed' 0
+[ -z "$owned_device" ] || fail 'renamed interface inherited ownership'
+[ "$next_try" -gt "$clock" ] || fail 'rename bypassed backoff'
+retry_time
+assert_count 'UP Renamed' 1
+assert_count 'AT+ZGACT=1,1' 2
+renamed_down=$(grep -Fxc 'DOWN Renamed' "$TRACE" || :)
+cfg_device=lan0 network_interface=Unrelated
+reconcile
+assert_count 'DOWN Renamed' "$renamed_down"
+assert_count 'UP Unrelated' 0
+[ -z "$interface$owned_device" ] || fail 'rebound interface still selected/owned'
+printf 'ok - rename resets ownership and requires fresh activation after backoff; rebind is not torn down\n'
+
+reset
+cfg_interface='' configured_interface=''
+connect
+cfg_type=deleted
+reconcile
+assert_count 'DOWN modem' 0
+[ -z "$interface$owned_device" ] || fail 'removed section retained ownership'
+cfg_type=interface network_interface=Replacement fake_up=true fake_ipv4=192.0.2.2 fake_pending=false
+retry_time
+assert_count 'UP Replacement' 0
+assert_count 'DOWN Replacement' 0
+[ -z "$owned_device" ] || fail 'unowned replacement adopted'
+printf 'ok - deleted interface is forgotten; already-online replacement cannot be adopted\n'
+
+for race in rename delete ambiguity; do
+	reset
+	cfg_interface='' configured_interface=''
+	change_at='AT+CGATT?' change_kind=$race
+	reconcile
+	assert_count 'UP modem' 0
+	assert_count 'AT+ZGACT=1,1' 0
+done
+printf 'ok - auto binding rename/removal/ambiguity during AT invalidate attempt before activation\n'
+
+for race in rename delete ambiguity binding event; do
+	reset
+	cfg_interface='' configured_interface=''
+	change_at='AT+ZGACT=1,1' change_kind=$race
+	reconcile
+	assert_count 'UP modem' 0
+	assert_count 'AT+ZGACT=1,1' 1
+done
+printf 'ok - binding and event changes at final AT command cannot start DHCP from stale attempts\n'
+
+reset
+connect
+interface=Other
+network_down
+assert_count 'DOWN Other' 0
+assert_count 'DOWN modem' 0
+[ -z "$owned_device$owned_interface" ] || fail 'foreign logical ownership not discarded'
+reset
+cfg_interface=Modem configured_interface=Modem interface=''
+reconcile
+assert_count AT 0
+[ "$validation_reason" = target-interface-missing ] || fail 'explicit selector ignored case'
+printf 'ok - cleanup cannot tear down foreign logical target; explicit selection never guesses names or case\n'
+
+reset
+cfg_interface='' configured_interface='' next_try=200 backoff=20 recover_next=400
+network_interface=NewName
+reconcile
+assert_count AT 0
+assert_count 'UP NewName' 0
+[ "$next_try" -ge 200 ] && [ "$recover_next" = 400 ] || fail 'target change reset safety timers'
+cfg_at_interface='' at_interface=''
+reconcile
+assert_count AT 0
+printf 'ok - target changes and automatic AT discovery preserve retry and recovery timers\n'
+
+reset
+cfg_interface=''
+INTERFACE=Arbitrary ACTION=ifupdate
+. "$ROOT/package/mf832s/files/20-mf832s-iface"
+assert_count WAKE 1
+cfg_interface=modem INTERFACE=Modem
+. "$ROOT/package/mf832s/files/20-mf832s-iface"
+assert_count WAKE 1
+printf 'ok - auto hotplug wakes on arbitrary names; explicit hook matching is case-sensitive\n'
 printf 'All state-machine regression tests passed\n'

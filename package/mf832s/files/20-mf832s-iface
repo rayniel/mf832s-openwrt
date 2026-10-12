@@ -3,7 +3,7 @@
 (
 	[ "$(uci -q get mf832s.main.enabled)" = 1 ] || exit 0
 	target=$(uci -q get mf832s.main.interface)
-	[ "$INTERFACE" = "${target:-mf832s}" ] || exit 0
+	[ -z "$target" ] || [ "$INTERFACE" = "$target" ] || exit 0
 	case "$ACTION" in
 		ifup|ifdown|ifup-failed|ifupdate)
 			# Wake only; the monitor's ubus listener preserves down/up edges.

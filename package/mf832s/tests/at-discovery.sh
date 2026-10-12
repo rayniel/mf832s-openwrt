@@ -2,7 +2,8 @@
 # Exercise real discovery and bounded AT transport against a fake USB topology.
 set -u
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
-TMP=$(mktemp -d) || exit 1
+TMP=$ROOT/package/mf832s/tests/.at-discovery.$$
+mkdir "$TMP" || exit 1
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 sed '/^\. \/lib\/functions.sh$/d; /^log .Starting MF832S monitor build=/,$d' \
 	"$ROOT/package/mf832s/files/mf832s-monitor" |
@@ -46,6 +47,7 @@ ln -s /dev/null "$TMP/dev/ttyUSB9"
 cat >"$TMP/bin/stty" <<'EOF'
 #!/bin/sh
 printf 'STTY %s\n' "$*" >>"$TRACE"
+[ "$*" = "-F $2 raw -echo clocal -hupcl -crtscts" ] || exit 1
 printf '%s\n' "$2" >"$SELECTED_FILE"
 EOF
 cat >"$TMP/bin/chat" <<'EOF'
@@ -67,6 +69,7 @@ export PROBE_RUN SUCCESS_PORT
 vid=19d2 pid=0199 usb_path='' serial='' at_interface='' at_device='' net_device=''
 retry_initial=5 retry_max=120 backoff=5 query_timeout=2 transaction_timeout=20
 event_listener=$$ event_reader=$$ event_guard=$$
+event_interface=$interface
 printf '0\n' >"$RUN/iface-sequence"
 : >"$TRACE"
 discover || fail "discovery: $discovery_reason"
