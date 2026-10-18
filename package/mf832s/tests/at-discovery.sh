@@ -7,7 +7,7 @@ mkdir "$TMP" || exit 1
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 sed '/^\. \/lib\/functions.sh$/d; /^log .Starting MF832S monitor build=/,$d' \
 	"$ROOT/package/mf832s/files/mf832s-monitor" |
-	sed "s|/sys/|$TMP/sys/|g; s|candidate=/dev/|candidate=$TMP/dev/|" \
+	sed "s|/sys/|$TMP/sys/|g; s|candidate=/dev/|candidate=$TMP/dev/|; s|exec stty |exec $TMP/bin/stty |; s|exec chat |exec $TMP/bin/chat |" \
 	>"$TMP/functions"
 . "$TMP/functions"
 RUN=$TMP/instance
@@ -46,12 +46,14 @@ ln -s "$TMP/other" "$TMP/sys/class/tty/ttyUSB9/device"
 ln -s /dev/null "$TMP/dev/ttyUSB9"
 cat >"$TMP/bin/stty" <<'EOF'
 #!/bin/sh
+[ ! -e /proc/self/fd/8 ] || exit 99
 printf 'STTY %s\n' "$*" >>"$TRACE"
 [ "$*" = "-F $2 raw -echo clocal -hupcl -crtscts" ] || exit 1
 printf '%s\n' "$2" >"$SELECTED_FILE"
 EOF
 cat >"$TMP/bin/chat" <<'EOF'
 #!/bin/sh
+[ ! -e /proc/self/fd/8 ] || exit 99
 [ "$*" = "-S -s -V -f $PROBE_RUN/query.chat" ] || exit 99
 grep -Fx "'' 'AT'" "$PROBE_RUN/query.chat" >/dev/null || exit 99
 grep -Fx "'\\r\\nOK\\r\\n' '\\c'" "$PROBE_RUN/query.chat" >/dev/null || exit 99
@@ -71,6 +73,7 @@ retry_initial=5 retry_max=120 backoff=5 query_timeout=2 transaction_timeout=20
 event_listener=$$ event_reader=$$ event_guard=$$
 event_interface=$interface
 printf '0\n' >"$RUN/iface-sequence"
+arm_wake || fail 'could not arm wake descriptor for child inheritance test'
 : >"$TRACE"
 discover || fail "discovery: $discovery_reason"
 generation=$found_generation
@@ -178,3 +181,25 @@ attempt_event=$(interface_event)
 printf '5\n' >"$usb_fixture/devnum"
 configure_serial && fail 'changed USB generation opened for probing'
 printf 'ok - destructive commands and stale-generation serial opens rejected\n'
+
+# Early discovery failure must revoke confirmation even when the USB device
+# stays present and its tty name later returns unchanged.
+transaction_active=0 interrupted=0 next_try=0 SUCCESS_PORT=ttyUSB0
+discover || fail 'same-generation tty loss fixture failed'
+generation=$found_generation
+auto_at=$TMP/dev/ttyUSB0 auto_generation=$generation
+printf '%s\n%s\n' "$generation" "$auto_at" >"$TMP/at-port"
+rm "$TMP/dev/ttyUSB0" "$TMP/dev/ttyUSB1" "$TMP/dev/ttyUSB2"
+event_listener='' event_reader='' event_guard=''
+reconcile
+[ "$discovery_reason" = serial-ports-not-ready ] || fail 'missing ttys did not fail before selection'
+[ -z "$auto_at$auto_generation" ] && [ ! -f "$TMP/at-port" ] ||
+	fail 'early no-tty discovery failure retained AT confirmation'
+[ "$generation" = "$found_generation" ] || fail 'tty loss forgot physical generation'
+ln -s /dev/null "$TMP/dev/ttyUSB0"
+event_listener=$$ event_reader=$$ event_guard=$$
+before=$(grep -c '^AT ' "$TRACE")
+discover && select_at || fail 'same tty name did not recover after discovery failure'
+[ "$at" = "$TMP/dev/ttyUSB0" ] && [ "$(grep -c '^AT ' "$TRACE")" -eq "$((before + 1))" ] ||
+	fail 'same-generation returned tty reused confirmation without a fresh AT-only probe'
+printf 'ok - early no-tty discovery revokes memory/disk confirmation; same-generation tty name return is reprobed\n'

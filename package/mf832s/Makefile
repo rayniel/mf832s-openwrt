@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=mf832s
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=6
+PKG_RELEASE:=7
 PKG_LICENSE:=GPL-3.0-only
 PKG_LICENSE_FILES:=LICENSE
 PKGARCH:=all
@@ -48,10 +48,13 @@ define Package/mf832s/install
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) ./files/mf832s-monitor $(1)/usr/sbin/mf832s-monitor
 	$(INSTALL_BIN) ./files/mf832s-status $(1)/usr/sbin/mf832s-status
-	$(INSTALL_DIR) $(1)/etc/hotplug.d/usb $(1)/etc/hotplug.d/net $(1)/etc/hotplug.d/iface
+	$(INSTALL_DIR) $(1)/usr/share/mf832s
+	$(INSTALL_DATA) ./files/hotplug.sh $(1)/usr/share/mf832s/hotplug.sh
+	$(INSTALL_DIR) $(1)/etc/hotplug.d/usb $(1)/etc/hotplug.d/net $(1)/etc/hotplug.d/iface $(1)/etc/hotplug.d/tty
 	$(INSTALL_DATA) ./files/20-mf832s $(1)/etc/hotplug.d/usb/20-mf832s
 	$(INSTALL_DATA) ./files/20-mf832s-net $(1)/etc/hotplug.d/net/20-mf832s
 	$(INSTALL_DATA) ./files/20-mf832s-iface $(1)/etc/hotplug.d/iface/20-mf832s
+	$(INSTALL_DATA) ./files/20-mf832s-tty $(1)/etc/hotplug.d/tty/20-mf832s
 endef
 
 $(eval $(call BuildPackage,mf832s))

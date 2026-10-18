@@ -79,12 +79,19 @@ uci() {
 usb_parent() { printf '%s\n' "$physical_usb"; }
 stamp() { printf '%s\n' "$physical_generation"; }
 discover() {
+	usb='' at='' net='' found_generation=''
 	case "$discovery" in
 		good) :;;
 		missing) discovery_reason=usb-vid-pid-not-found; return 1;;
-		no-at) discovery_reason=selected-at-port-not-ready; return 1;;
+		no-at|no-auto)
+			usb=/usb/modem found_generation=$physical_generation
+			discovery_reason=selected-at-port-not-ready
+			[ "$discovery" != no-auto ] || discovery_reason=serial-ports-not-ready
+			return 1;;
 		multiple) discovery_reason=multiple-matching-usb-modems; return 1;;
-		no-net) discovery_reason=usb-network-device-not-ready; return 1;;
+		no-net)
+			usb=/usb/modem at=/dev/ttyUSB0 found_generation=$physical_generation
+			discovery_reason=usb-network-device-not-ready; return 1;;
 	esac
 	usb=/usb/modem at=/dev/ttyUSB0 net=usb0
 	if [ -z "$at_interface$at_device" ]; then
@@ -94,7 +101,7 @@ discover() {
 	found_generation=$physical_generation
 }
 ensure_events() { event_interface=$interface; [ "$events_ok" = 1 ]; }
-stop_events() { :; }
+stop_events() { stop_count=$((stop_count + 1)); }
 event_barrier() {
 	[ "$events_ok" = 1 ] && [ "$barrier_ok" = 1 ] || return 1
 	# A fence drains events queued by the service's own down.
@@ -195,7 +202,7 @@ reset() {
 	usb=/usb/modem at=/dev/ttyUSB0 net=usb0
 	fake_up=false fake_pending=false fake_available=true fake_device=usb0 fake_l3=usb0 fake_ipv4=''
 	status_ok=1 down_ok=1 pdp_active=1 events_ok=1 barrier_ok=1 queued_down=0
-	real_events=0
+	real_events=0 stop_count=0
 	online_on_check=0
 	printf '0\n' >"$RUN/status-count"
 	clock=100 sequence=0 event_epoch=1 event_interface=modem
@@ -203,8 +210,9 @@ reset() {
 	event_listener=$$ event_reader=$$ event_guard=$$
 	owned_interface='' owned_device='' owned_usb='' owned_generation='' owned_event='' owned_online=0
 	next_try=0 lease_deadline=0 interrupted=0 transaction_active=0 health_next=0
+	enumeration_generation='' enumeration_deadline=0 enumeration_wait=0 discovery_ready=0
 	health_bad=0 recover_bad=0 recover_next=0 diagnostic='' at_failure=unknown-response
-	retry_initial=5 retry_max=120 backoff=5 dhcp_timeout=60 health_interval=30
+	retry_initial=5 retry_max=120 backoff=5 dhcp_timeout=60 health_interval=30 poll_interval=10
 	health_failures=3 recover_threshold=3 recover_mode=none recover_cooldown=120
 	transaction_timeout=45 query_timeout=5 cid=1 pdp_type=IPV4V6 apn=''
 	fail_at='' change_at='' change_kind=''
@@ -216,6 +224,7 @@ retry_time() { clock=$next_try; interrupted=0; reconcile; }
 reset
 fake_pending=true
 connect
+[ "$(wait_delay)" = "$cfg_poll_interval" ] || fail 'pending DHCP lost active polling timer'
 assert_count 'DOWN modem' 1
 assert_count 'AT+ZGACT=1,1' 1
 assert_count 'AT+CGDCONT=1,"IPV4V6",""' 0
@@ -225,6 +234,7 @@ printf 'ok - cold unowned pending, active PDP preserved, fresh ZTE before DHCP\n
 reset
 connect
 online
+[ "$(wait_delay)" = "$cfg_poll_interval" ] || fail 'online health lost active polling timer'
 fake_up=false fake_pending=true
 sequence=1; printf '1\n' >"$RUN/iface-sequence"
 reconcile
@@ -392,14 +402,17 @@ printf 'ok - generation, pending, binding and down-edge races cancel AT\n'
 
 reset
 connect
+old_at=$at old_net=$net
 physical_generation=usb:2
 fake_pending=true
 clock=200
 reconcile
 assert_count 'AT+ZGACT=1,1' 2
 assert_count 'DOWN modem' 1
+[ "$at:$net:$owned_generation" = "$old_at:$old_net:usb:2" ] ||
+	fail 'reused tty/net names retained the previous physical generation'
 assert_order
-printf 'ok - USB re-enumeration starts a fresh connection generation\n'
+printf 'ok - USB re-enumeration with reused tty/net names requires fresh activation\n'
 
 for command in AT 'AT+CPIN?' 'AT+CEREG?' 'AT+CGATT?' 'AT+ZGACT=1,1'; do
 	reset
@@ -447,6 +460,107 @@ for discovery_case in missing no-at multiple no-net; do
 done
 printf 'ok - USB, AT, ambiguous modem and data-device discovery failures are distinct\n'
 
+for discovery_case in no-at no-net no-auto; do
+	reset
+	generation='' discovery=$discovery_case
+	[ "$discovery_case" != no-auto ] || { at_interface='' cfg_at_interface=''; }
+	reconcile
+	[ "$enumeration_deadline" = 160 ] || fail 'late readiness fixture did not open enumeration window'
+	clock=160
+	reconcile
+	[ "$(wait_delay)" = 0 ] || fail 'late readiness fixture did not reach event-only waiting'
+	assert_count 'UP modem' 0
+	discovery=good clock=200
+	connect
+	[ "$enumeration_deadline" = 160 ] || fail 'late readiness reopened expired generation window'
+	assert_count 'AT+ZGACT=1,1' 1
+done
+printf 'ok - late tty/net and automatic no-tty readiness after expiry activate AT before starting DHCP\n'
+
+for discovery_case in no-at no-net; do
+	reset
+	next_try=150 backoff=20 recover_next=300 recover_bad=2 health_bad=2
+	discovery=$discovery_case
+	reconcile
+	[ "$generation" = usb:1 ] && [ "$next_try:$backoff:$recover_next:$recover_bad:$health_bad" = 150:20:300:2:2 ] ||
+		fail "$discovery_case transient readiness reset physical-generation retry state"
+	discovery=good clock=149
+	reconcile
+	assert_count 'AT+ZGACT=1,1' 0
+	[ "$next_try:$backoff:$recover_next:$recover_bad:$health_bad" = 150:20:300:2:2 ] ||
+		fail 'same-generation readiness bypassed backoff or cleared failure counters'
+	clock=150
+	connect
+done
+printf 'ok - same-generation tty/net disappearance and readiness preserve retry/backoff/recovery deadlines\n'
+
+reset
+next_try=150 backoff=20 recover_next=300 recover_bad=2
+physical_generation=usb:2 discovery=no-at
+reconcile
+discovery=good
+connect
+[ "$generation:$next_try:$backoff:$recover_next:$recover_bad" = usb:2:0:5:300:0 ] ||
+	fail 'new physical generation did not reset connection retry state while retaining radio cooldown'
+printf 'ok - different USB generation resets connection backoff, not radio recovery cooldown\n'
+
+reset
+connect
+online
+auto_at=/dev/ttyUSB0 auto_generation=usb:1
+printf 'usb:1\n/dev/ttyUSB0\n' >"$RUN/at-port"
+discovery=missing down_ok=0
+reconcile
+[ -z "$generation$auto_at$auto_generation$owned_device" ] || fail 'absence retained device ownership or AT cache'
+[ ! -f "$RUN/at-port" ] && [ "$stop_count" = 1 ] || fail 'absence retained cache file or listener'
+[ "$has_ipv4:$observed_ipv4:$state_health:$lease_deadline" = false:false:unknown:0 ] ||
+	fail 'absence retained online state'
+grep -Fx 'has_ipv4=false' "$STATUS_FILE" >/dev/null || fail 'absence published stale IPv4 status'
+printf 'ok - true absence clears listener/cache/ownership and publishes offline status\n'
+
+for ending in readiness stop; do
+	reset
+	connect
+	online
+	old_owner=$owned_interface:$owned_device:$owned_usb:$owned_generation:$owned_event
+	discovery=no-at down_ok=0
+	reconcile
+	[ "$owned_interface:$owned_device:$owned_usb:$owned_generation:$owned_event" = "$old_owner" ] ||
+		fail 'failed same-generation teardown discarded fenced live ownership'
+	[ "$generation" = usb:1 ] && [ "$has_ipv4" = false ] ||
+		fail 'transient teardown failure lost generation or published stale lease'
+	assert_count 'DOWN modem' 1
+	assert_count 'UP modem' 1
+	[ "$(wait_delay)" = "$poll_interval" ] || fail 'retained teardown lost bounded enumeration timer'
+	clock=$((clock + poll_interval))
+	reconcile
+	assert_count 'DOWN modem' 2
+	[ "$owned_interface:$owned_device:$owned_usb:$owned_generation:$owned_event" = "$old_owner" ] ||
+		fail 'bounded teardown retry discarded retained ownership'
+	down_ok=1
+	if [ "$ending" = readiness ]; then
+		discovery=good fake_up=false fake_pending=false
+		reconcile
+		[ -z "$owned_device" ] || fail 'returned readiness did not complete retained teardown'
+		assert_count 'UP modem' 1
+		retry_time
+		assert_count 'UP modem' 2
+		assert_count 'AT+ZGACT=1,1' 2
+		assert_order
+	else
+		(
+			RUN=$TMP/stop-retained-owner
+			mkdir "$RUN"
+			cleanup
+			[ -z "$owned_device" ] || fail 'stop could not tear down retained owner'
+			[ ! -d "$RUN" ] || fail 'stop retained private runtime directory'
+		) || fail 'cleanup failed after transient teardown failure'
+		assert_count 'UP modem' 1
+	fi
+	assert_count 'DOWN modem' 3
+done
+printf 'ok - failed same-generation teardown retains its ownership fence for readiness retry or service stop\n'
+
 reset
 fake_pending=true online_on_check=3
 reconcile
@@ -476,6 +590,7 @@ reset
 recover_mode=cfun_cycle recover_threshold=1
 fail_at='AT+CPIN?'
 reconcile
+[ "$(wait_delay)" = "$cfg_poll_interval" ] || fail 'AT backoff lost active polling timer'
 assert_count 'AT+CFUN=0' 1
 assert_count 'AT+CFUN=1' 1
 retry_time
@@ -521,7 +636,13 @@ reconcile
 assert_count 'DOWN modem' 1
 assert_count 'AT+ZGACT=1,1' 2
 assert_order
-stop_events
+listener=$event_listener reader=$event_reader guard=$event_guard
+discovery=missing
+reconcile
+[ -z "$event_listener$event_reader$event_guard" ] || fail 'absent modem retained event process handles'
+! kill -0 "$listener" 2>/dev/null || fail 'absent modem retained listener process'
+! kill -0 "$reader" 2>/dev/null || fail 'absent modem retained event reader process'
+! kill -0 "$guard" 2>/dev/null || fail 'absent modem retained event guard process'
 stop_events() { :; }
 ensure_events() { event_interface=$interface; [ "$events_ok" = 1 ]; }
 event_barrier() {
@@ -536,6 +657,7 @@ exec 8>&-
 trap - USR1
 RUN=$TMP
 printf 'ok - real listener restart invalidates owned online attempt once, with backoff\n'
+printf 'ok - physical absence stops and reaps real listener, reader and lifetime guard\n'
 
 # Exercise the actual event reader with the one-line ubus listen envelope.
 reset
