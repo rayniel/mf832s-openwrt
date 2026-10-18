@@ -1,0 +1,12 @@
+#!/bin/sh
+
+(
+	. /usr/share/mf832s/hotplug.sh
+	case "$ACTION" in
+		add|remove|bind|unbind)
+			mf832s_target_event || exit 0
+			mf832s_signal
+			;;
+	esac
+	:
+)

@@ -1,13 +1,11 @@
 #!/bin/sh
 
 (
+	. /usr/share/mf832s/hotplug.sh
 	case "$ACTION" in
 		add|remove|register|unregister|move)
-			signal=$(kill -l USR1 2>/dev/null)
-			case "$signal" in
-				''|*[!0-9]*) :;;
-				*) ubus -t 1 call service signal "{\"name\":\"mf832s\",\"signal\":$signal}" >/dev/null 2>&1;;
-			esac
+			mf832s_target_event || exit 0
+			mf832s_signal
 			;;
 	esac
 	:

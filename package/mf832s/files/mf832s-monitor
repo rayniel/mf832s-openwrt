@@ -1,5 +1,8 @@
 #!/bin/sh
 
+startup_wake=0
+trap 'startup_wake=1' USR1
+
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 . /lib/functions.sh
@@ -48,6 +51,12 @@ event_interface=
 fence=0
 auto_at=
 auto_generation=
+wake_pending=0
+wake_ready=0
+enumeration_generation=
+enumeration_deadline=0
+enumeration_wait=0
+discovery_ready=0
 
 log() { logger -t mf832s "$*"; }
 notice() {
@@ -110,12 +119,68 @@ cancel() {
 }
 
 wake() {
+	if [ "$wake_ready" = 1 ] && [ "$wake_pending" = 0 ]; then
+		wake_pending=1
+		printf '\n' >&8
+	fi
 	if [ "$transaction_active" = 1 ]; then
 		# Duplicate/unrelated events must not starve a valid modem transaction.
 		transaction_valid && return
 		cancel
 	elif [ -n "$child" ]; then
 		cancel
+	fi
+}
+
+arm_wake() {
+	mkfifo "$RUN/wake" || return 1
+	exec 8<>"$RUN/wake" || return 1
+	wake_ready=1
+	trap wake USR1
+	# Signals received before the FIFO existed must survive startup too.
+	[ "$startup_wake" = 0 ] || wake
+}
+
+wait_wake() {
+	local delay token
+	delay=$1
+	if [ "$wake_pending" = 0 ] && [ "$delay" -gt 0 ]; then
+		(
+			exec 9>&- 8>&- 7>&-
+			exec sleep "$delay"
+		) &
+		child=$!
+		# A signal may have arrived between checking pending and publishing child.
+		[ "$wake_pending" = 0 ] || kill "$child" 2>/dev/null
+		wait "$child" 2>/dev/null
+		[ "$wake_pending" = 0 ] || {
+			kill "$child" 2>/dev/null
+			wait "$child" 2>/dev/null
+		}
+		child=
+	fi
+	if [ "$delay" = 0 ] || [ "$wake_pending" = 1 ]; then
+		# The queued byte closes the check-to-wait race. Signals interrupting read
+		# are retried; clearing pending is safe because reconciliation follows.
+		while ! IFS= read -r token <&8; do :; done
+		wake_pending=0
+	fi
+}
+
+wait_delay() {
+	local remaining
+	if [ "$discovery_ready" = 1 ]; then
+		printf '%s\n' "$poll_interval"
+	elif [ "$enumeration_wait" = 1 ]; then
+		remaining=$((enumeration_deadline - $(now)))
+		if [ "$remaining" -gt 0 ]; then
+			[ "$remaining" -le "$poll_interval" ] || remaining=$poll_interval
+			printf '%s\n' "$remaining"
+		else
+			printf '0\n'
+		fi
+	else
+		printf '0\n'
 	fi
 }
 
@@ -218,6 +283,7 @@ stamp() {
 discover() {
 	local path count candidate parent tty_path walk ifnum
 	usb='' at='' net=''
+	found_generation=
 	at_candidates=
 	count=0
 	for path in /sys/bus/usb/devices/*; do
@@ -260,6 +326,7 @@ discover() {
 		[ "$count" = 1 ] || { discovery_reason=multiple-matching-at-ports; return 1; }
 	else
 		at=
+		[ "$count" -gt 0 ] || { discovery_reason=serial-ports-not-ready; return 1; }
 		at_candidates=$(printf '%s' "$at_candidates" | sort -k1,1 -k2,2)
 	fi
 	count=0
@@ -384,6 +451,8 @@ cleanup() {
 	[ -z "$child" ] || kill -KILL "$child" 2>/dev/null
 	[ -z "$child" ] || wait "$child" 2>/dev/null
 	stop_events
+	wake_ready=0
+	exec 8>&-
 	network_down
 	# The persistent lock is outside this private directory and is never unlinked.
 	rm -rf "$RUN"
@@ -457,14 +526,14 @@ ensure_events() {
 	mkfifo "$RUN/events" "$RUN/lifetime" || return 1
 	exec 7<>"$RUN/lifetime" || return 1
 	printf '0\n' >"$RUN/iface-sequence"
-	( exec 9>&- 7>&-; read_events <"$RUN/events" ) &
+	( exec 9>&- 8>&- 7>&-; read_events <"$RUN/events" ) &
 	event_reader=$!
-	( exec 9>&- 7>&-; exec ubus -S listen network.interface mf832s.fence >"$RUN/events" 2>/dev/null ) &
+	( exec 9>&- 8>&- 7>&-; exec ubus -S listen network.interface mf832s.fence >"$RUN/events" 2>/dev/null ) &
 	event_listener=$!
 	# Open the read end before forking: a crash must not leave the guard in open().
 	exec 6<"$RUN/lifetime" || return 1
 	(
-		exec 9>&- 7>&-
+		exec 9>&- 8>&- 7>&-
 		# EOF also arrives on SIGKILL/crash, when normal cleanup cannot run.
 		while IFS= read -r line; do :; done <&6
 		kill "$event_listener" "$event_reader" 2>/dev/null
@@ -531,7 +600,7 @@ query() {
 	} >"$RUN/query.chat"
 	# Transcript is private and never passed to logger (it may contain an APN).
 	(
-		exec 9>&- 7>&-
+		exec 9>&- 8>&- 7>&-
 		exec chat -S -s -V -f "$RUN/query.chat" <"$at" >"$at" 2>"$RUN/response"
 	) &
 	child=$!
@@ -622,7 +691,7 @@ configure_serial() {
 	[ "$end" -le "$transaction_end" ] || end=$transaction_end
 	[ "$end" -gt "$(now)" ] || { at_failure=timeout; return 1; }
 	(
-		exec 9>&- 7>&-
+		exec 9>&- 8>&- 7>&-
 		# USB virtual ports may reject baud changes; preserve the driver's speed.
 		exec stty -F "$at" raw -echo clocal -hupcl -crtscts 2>/dev/null
 	) &
@@ -863,7 +932,7 @@ recover() {
 	rc=1
 	if begin_transaction && recovery_ready && query 'AT+CFUN=0'; then
 		(
-			exec 9>&- 7>&-
+			exec 9>&- 8>&- 7>&-
 			exec sleep 2
 		) &
 		child=$!
@@ -878,12 +947,44 @@ recover() {
 reconcile() {
 	local previous current activation_rc recover_owned lease_changed previous_health
 	previous=$generation
-	set_stage usb-discovery 'searching configured VID/PID and USB topology' quiet
+	discovery_ready=0 enumeration_wait=0
 	if ! discover; then
-		stage_failure usb-discovery "$discovery_reason; waiting for an unambiguous ready device"
+		case "$discovery_reason" in
+			selected-at-port-not-ready|serial-ports-not-ready|usb-network-device-not-ready|usb-device-not-ready)
+				if [ -n "$usb" ]; then
+					if [ "$enumeration_generation" != "${found_generation:-$usb:unready}" ]; then
+						enumeration_generation=${found_generation:-$usb:unready}
+						enumeration_deadline=$(( $(now) + 60 ))
+					fi
+					enumeration_wait=1
+				fi
+				;;
+		esac
 		network_down
-		generation=
+		# Failed teardown retains its fence while this physical owner survives.
+		# Forgetting it would turn a live connection into an unowned interface.
+		if [ "$discovery_reason" = usb-vid-pid-not-found ] ||
+			{ [ -n "$found_generation" ] && [ "$found_generation" != "$owned_generation" ]; } ||
+			{ [ -n "$owned_usb" ] && [ "$(stamp "$owned_usb" 2>/dev/null)" != "$owned_generation" ]; }; then
+			owned_interface='' owned_device='' owned_usb='' owned_generation='' owned_event='' owned_online=0
+		fi
+		stop_events
+		auto_at='' auto_generation=''
+		rm -f "${STATUS_FILE%/*}/at-port"
+		# A missing child interface is not a new physical USB connection.
+		# Preserve its backoff/cooldown until a different generation is observed.
+		[ -n "$found_generation" ] && [ "$found_generation" = "$generation" ] ||
+			generation=
+		has_ipv4=false observed_ipv4=false state_health=unknown
+		lease_deadline=0 health_next=0
+		stage_failure usb-discovery "$discovery_reason; waiting for an unambiguous ready device"
+		write_state
 		return
+	fi
+	discovery_ready=1
+	if [ "$enumeration_generation" != "$found_generation" ]; then
+		enumeration_generation=$found_generation
+		enumeration_deadline=$(( $(now) + 60 ))
 	fi
 	generation=$found_generation
 	if [ "$generation" != "$previous" ]; then
@@ -1140,7 +1241,7 @@ reconcile() {
 	fi
 }
 
-log 'Starting MF832S monitor build=1.0.0-r3'
+log 'Starting MF832S monitor build=1.0.0-r7'
 if ! mkdir -p "$RUN"; then
 	log 'Startup failed: cannot create runtime directory /var/run/mf832s'
 	exit 1
@@ -1192,22 +1293,20 @@ RUN=$(mktemp -d "$RUN/instance.XXXXXX") || {
 }
 printf '%s\n' "$$" >"$RUN/pid"
 monitor_pid=$$
+arm_wake || {
+	log 'Startup failed: cannot arm private wake queue'
+	rm -rf "$RUN"
+	exit 1
+}
+trap 'cleanup; exit 0' TERM INT
 state_service=running
 stage_started=$(now)
 stage_updated=$stage_started
 stage_reason='monitor initialized; discovering modem'
 write_state
-trap 'cleanup; exit 0' TERM INT
-trap wake USR1
 while :; do
 	interrupted=0
 	reconcile
-	# Events cancel work but do not reset backoff; polling catches missed events.
-	(
-		exec 9>&- 7>&-
-		exec sleep "$poll_interval"
-	) &
-	child=$!
-	wait "$child" 2>/dev/null
-	child=
+	# Only active devices and bounded enumeration need timers.
+	wait_wake "$(wait_delay)"
 done
