@@ -61,9 +61,73 @@ option at_device ''
 
 - OpenWrt 24.10 or a compatible release family.
 - A working MF832S modem with the correct USB drivers for your hardware.
-- `coreutils-stty` from the `packages` feed.
-- `coreutils-od` for JSON status output (installed as a package dependency).
+- `coreutils`, `coreutils-stty` and `coreutils-od` from the `packages` feed (all selected automatically as package dependencies; `stty` is used for AT port setup, `od` for JSON status output).
 - A proper DHCP interface in `/etc/config/network`.
+
+## 安装与构建
+
+本项目目前声明支持 OpenWrt 24.10 或兼容版本。
+
+1. 在 OpenWrt 源码根目录启用 `packages` feed（提供 `coreutils`），并更新、安装 feed：
+
+   ```sh
+   ./scripts/feeds update -a
+   ./scripts/feeds install -a
+   ```
+
+2. 把**整个仓库**克隆到源码树的 `package/` 下，保持现有目录结构；不要只复制内部的 `package/mf832s` 目录，构建时会从仓库根目录复制 `LICENSE`：
+
+   ```sh
+   git clone https://github.com/rayniel/mf832s-openwrt.git package/mf832s-openwrt
+   ```
+
+   实际的包定义位于 `package/mf832s-openwrt/package/mf832s/Makefile`，在 OpenWrt 包扫描深度之内。
+
+3. 执行 `make menuconfig`，进入 **Network → WWAN**，选择 **`mf832s`**（菜单项名称是 `mf832s`，不是仓库名 `mf832s-openwrt`，也不在 LuCI 菜单中）。选择后会自动选中 `coreutils`、`coreutils-stty`、`coreutils-od` 等依赖。按硬件另行选择 USB 串口和 USB 网卡驱动。保存配置后退出。
+
+4. 单独构建软件包：
+
+   ```sh
+   make package/mf832s/compile V=s
+   ```
+
+   或者随固件一起执行 `make`。
+
+## 菜单中找不到 mf832s 的排查
+
+在 OpenWrt 源码根目录执行：
+
+```sh
+# 1. 确认 Makefile 能被扫描到
+find -L package -maxdepth 5 -name Makefile -path '*mf832s*' -print
+
+# 2. 重新生成包元数据并查看扫描告警
+make prepare-tmpinfo V=s 2>&1 | grep -nE 'mf832s|ERROR|WARNING'
+
+# 3. 检查包信息和菜单项是否生成，以及生成的依赖条件
+grep -n -A 25 '^Package: mf832s$' tmp/.packageinfo
+grep -n -A 30 'config PACKAGE_mf832s$' tmp/.config-package.in
+```
+
+- 若 `tmp/.config-package.in` 中 `config PACKAGE_mf832s` 下出现 `depends on PACKAGE_xxx`，表示菜单项只有在 `xxx` 被启用后才可见。OpenWrt 的元数据生成器会把被选中软件包的普通依赖（不带 `+` 的依赖）继承为当前包的 `depends on`。例如旧版 `packages` feed（如 `openwrt-19.07` 分支）中 `coreutils-stty`、`coreutils-od` 声明的是 `DEPENDS:=coreutils`，旧版本仓库会因此生成 `depends on PACKAGE_coreutils`，未启用 `coreutils` 时 `mf832s` 被隐藏。本仓库已在 `DEPENDS` 中显式声明 `+coreutils`，生成结果应为 `select PACKAGE_coreutils`，不应再出现该限制；如果仍然出现，请确认源码树中的仓库已更新，并重新执行 `make prepare-tmpinfo`。
+- 遇到其他 `depends on` 条件时，先在 menuconfig 中启用对应的软件包（可用 `/` 搜索符号名），再回到 **Network → WWAN** 查找。
+- 不要手动编辑 `tmp/` 下的生成文件；修改包的 Makefile 后重新生成元数据即可。
+- 如果怀疑元数据缓存过期，可先退出 menuconfig，只删除包元数据缓存后重新生成（不会删除 `.config` 和编译产物）：
+
+  ```sh
+  rm -f tmp/info/.packageinfo-* tmp/info/.files-packageinfo*
+  rm -f tmp/info/.overrides-packageinfo-*
+  rm -f tmp/.packageinfo tmp/.config-package.in
+  make menuconfig
+  ```
+
+- 退出 menuconfig 时提示 `Your configuration changes were NOT saved.` 表示本次修改未保存，需要在退出时选择保存。保存后可用以下命令确认：
+
+  ```sh
+  grep -E 'CONFIG_PACKAGE_(coreutils|coreutils-stty|coreutils-od|mf832s)[ =]' .config
+  ```
+
+注意：上述依赖调整只解决旧版构建系统中的菜单可见性问题，**不代表本项目已完整支持 OpenWrt 19.07 等旧版本**。运行时逻辑按 24.10 设计（例如按 network 接口的 `device` 选项匹配 USB 网络设备，而旧版本通常使用 `ifname`），在旧版本上的运行兼容性未经验证。
 
 ## 热插拔与接口联动
 
