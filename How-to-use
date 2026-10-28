@@ -111,6 +111,7 @@ grep -n -A 30 'config PACKAGE_mf832s$' tmp/.config-package.in
 ```
 
 - 若 `tmp/.config-package.in` 中 `config PACKAGE_mf832s` 下出现 `depends on PACKAGE_xxx`，表示菜单项只有在 `xxx` 被启用后才可见。OpenWrt 的元数据生成器会把被选中软件包的普通依赖（不带 `+` 的依赖）继承为当前包的 `depends on`。例如旧版 `packages` feed（如 `openwrt-19.07` 分支）中 `coreutils-stty`、`coreutils-od` 声明的是 `DEPENDS:=coreutils`，旧版本仓库会因此生成 `depends on PACKAGE_coreutils`，未启用 `coreutils` 时 `mf832s` 被隐藏。本仓库已在 `DEPENDS` 中显式声明 `+coreutils`，生成结果应为 `select PACKAGE_coreutils`，不应再出现该限制；如果仍然出现，请确认源码树中的仓库已更新，并重新执行 `make prepare-tmpinfo`。
+- OpenWrt 19.07 的 USB 串口和网卡驱动子包也分别普通依赖 `kmod-usb-serial` 和 `kmod-usb-net`。本包显式声明 `+kmod-usb-serial` 和 `+kmod-usb-net`，生成规则应为自动 `select` 这两个基础包，无需先手动勾选两个驱动大类才能选择 MF832S。
 - 遇到其他 `depends on` 条件时，先在 menuconfig 中启用对应的软件包（可用 `/` 搜索符号名），再回到 **Network → WWAN** 查找。
 - 不要手动编辑 `tmp/` 下的生成文件；修改包的 Makefile 后重新生成元数据即可。
 - 如果怀疑元数据缓存过期，可先退出 menuconfig，只删除包元数据缓存后重新生成（不会删除 `.config` 和编译产物）：

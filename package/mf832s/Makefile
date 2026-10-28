@@ -16,7 +16,8 @@ define Package/mf832s
   TITLE:=ZTE MF832S AT activation and USB Ethernet monitor
   URL:=https://github.com/rayniel/mf832s-openwrt
   DEPENDS:=+busybox +chat +coreutils +coreutils-stty +coreutils-od +flock +netifd +uci +ubus +procd +jsonfilter \
-	+kmod-usb-serial-option +kmod-usb-net-cdc-ether +kmod-usb-net-rndis
+	+kmod-usb-serial +kmod-usb-serial-option \
+	+kmod-usb-net +kmod-usb-net-cdc-ether +kmod-usb-net-rndis
 endef
 
 define Package/mf832s/description
