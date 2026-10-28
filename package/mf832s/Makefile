@@ -15,15 +15,16 @@ define Package/mf832s
   SUBMENU:=WWAN
   TITLE:=ZTE MF832S AT activation and USB Ethernet monitor
   URL:=https://github.com/rayniel/mf832s-openwrt
-  DEPENDS:=+busybox +chat +coreutils +coreutils-stty +coreutils-od +flock +netifd +uci +ubus +procd +jsonfilter
+  DEPENDS:=+busybox +chat +coreutils +coreutils-stty +coreutils-od +flock +netifd +uci +ubus +procd +jsonfilter \
+	+kmod-usb-serial-option +kmod-usb-net-cdc-ether +kmod-usb-net-rndis
 endef
 
 define Package/mf832s/description
   Supervised AT activation for a single ZTE MF832S, with DHCP managed by
   netifd. Starts automatically and silently waits for a matching modem; when a
-  modem is detected it performs AT activation and DHCP orchestration. Install
-  the USB serial and network drivers matching your hardware separately; no PPP,
-  QMI or LuCI stack is required.
+  modem is detected it performs AT activation and DHCP orchestration. Depends
+  on the USB serial option driver and CDC/RNDIS Ethernet drivers; no PPP, QMI
+  or LuCI stack is required.
 endef
 
 define Package/mf832s/conffiles

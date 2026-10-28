@@ -60,7 +60,8 @@ option at_device ''
 ## Requirements
 
 - OpenWrt 24.10 or a compatible release family.
-- A working MF832S modem with the correct USB drivers for your hardware.
+- A working MF832S modem. Installing this package also installs the USB
+  serial option driver and CDC/RNDIS Ethernet drivers used by the modem.
 - `coreutils`, `coreutils-stty` and `coreutils-od` from the `packages` feed (all selected automatically as package dependencies; `stty` is used for AT port setup, `od` for JSON status output).
 - A proper DHCP interface in `/etc/config/network`.
 
